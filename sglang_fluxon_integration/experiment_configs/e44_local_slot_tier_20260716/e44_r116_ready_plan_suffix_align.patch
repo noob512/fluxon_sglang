@@ -1,0 +1,312 @@
+--- unified_radix_cache_e44_r115_ready_prefix_shape_observe.py
++++ unified_radix_cache_e44_r116_ready_plan_suffix_align.py
+@@ -451,6 +451,7 @@
+         self.total_tokens = total_tokens
+         self.anchor_node_id = anchor_node_id
+         self.kv_plan_ptr = kv_plan_ptr
++        self.kv_plan_offset_pages = 0
+         self.gpu_staging_lease = gpu_staging_lease
+         self.gpu_direct = gpu_staging_lease is not None
+         self.gpu_remote_indices = tuple(int(index) for index in gpu_remote_indices)
+@@ -2297,11 +2298,57 @@
+             return False
+         if operation.kv_plan_ptr is None:
+             return False
+-        if exact and len(operation.hash_value) != len(hash_values):
++        plan_offset_pages = int(
++            getattr(operation, "kv_plan_offset_pages", 0)
++        )
++        if plan_offset_pages < 0:
++            return False
++        ready_pages = min(
++            len(operation.hash_value),
++            operation.completed_tokens // self.page_size,
++        )
++        plan_end_pages = plan_offset_pages + len(hash_values)
++        if exact and ready_pages - plan_offset_pages != len(hash_values):
+             return False
+-        if operation.completed_tokens < len(hash_values) * self.page_size:
++        if plan_end_pages > ready_pages:
+             return False
+-        return operation.hash_value[: len(hash_values)] == hash_values
++        return (
++            operation.hash_value[plan_offset_pages:plan_end_pages]
++            == hash_values
++        )
++
++    def _fluxon_hostless_ready_value_ptrs(
++        self,
++        backend: Any,
++        plan_ptr: int,
++        operation: _FluxonHostlessPrefetchOperation,
++        expected_count: int,
++    ) -> tuple[int, ...]:
++        plan_offset_pages = int(
++            getattr(operation, "kv_plan_offset_pages", 0)
++        )
++        plan_end_pages = plan_offset_pages + int(expected_count)
++        ready_pages = min(
++            len(operation.hash_value),
++            operation.completed_tokens // self.page_size,
++        )
++        if (
++            plan_offset_pages < 0
++            or expected_count <= 0
++            or plan_end_pages > ready_pages
++        ):
++            raise RuntimeError(
++                "Fluxon ready plan pointer slice is out of bounds: "
++                f"offset={plan_offset_pages} count={expected_count} "
++                f"ready={ready_pages}"
++            )
++        value_ptrs = backend.view_value_ptrs(plan_ptr, plan_end_pages)
++        if len(value_ptrs) != plan_end_pages:
++            raise RuntimeError(
++                "Fluxon ready plan pointer view returned the wrong length: "
++                f"expected={plan_end_pages} actual={len(value_ptrs)}"
++            )
++        return tuple(value_ptrs[plan_offset_pages:plan_end_pages])
+ 
+     def _fluxon_hostless_longest_ready_restore_node(
+         self,
+@@ -2323,6 +2370,8 @@
+             failure_shape.clear()
+             failure_shape.update(reason=reason, **fields)
+ 
++        operation.kv_plan_offset_pages = 0
++
+         if operation.kv_plan_ptr is None or not operation.hash_value:
+             _record_failure(
+                 "invalid_plan",
+@@ -2371,6 +2420,60 @@
+             )
+             return None
+ 
++        first_node = reverse_path[-1]
++        first_node_hashes = self._node_hash_values(first_node)
++        if not first_node_hashes:
++            _record_failure(
++                "empty_node_hashes",
++                ready_pages=ready_pages,
++                path_nodes=path_nodes,
++                path_pages=path_pages,
++                failure_node_index=0,
++                failure_node_pages=len(first_node.key) // self.page_size,
++                consumed_pages=0,
++                matched_pages=0,
++                remaining_ready_pages=ready_pages,
++                plan_offset_pages=0,
++                alignment_candidates=0,
++            )
++            return None
++
++        alignment_offsets = [
++            index
++            for index, operation_hash in enumerate(
++                operation.hash_value[:ready_pages]
++            )
++            if operation_hash == first_node_hashes[0]
++        ]
++        if len(alignment_offsets) != 1:
++            matched_pages = 0
++            for operation_hash, node_hash in zip(
++                operation.hash_value[:ready_pages], first_node_hashes
++            ):
++                if operation_hash != node_hash:
++                    break
++                matched_pages += 1
++            _record_failure(
++                (
++                    "node_hash_mismatch"
++                    if not alignment_offsets
++                    else "ambiguous_plan_suffix_alignment"
++                ),
++                ready_pages=ready_pages,
++                path_nodes=path_nodes,
++                path_pages=path_pages,
++                failure_node_index=0,
++                failure_node_pages=len(first_node_hashes),
++                consumed_pages=0,
++                matched_pages=matched_pages,
++                remaining_ready_pages=ready_pages,
++                plan_offset_pages=0,
++                alignment_candidates=len(alignment_offsets),
++            )
++            return None
++
++        plan_offset_pages = alignment_offsets[0]
++        operation.kv_plan_offset_pages = plan_offset_pages
+         consumed_pages = 0
+         ready_node: UnifiedTreeNode | None = None
+         for node_index, node in enumerate(reversed(reverse_path)):
+@@ -2385,11 +2488,15 @@
+                     failure_node_pages=len(node.key) // self.page_size,
+                     consumed_pages=consumed_pages,
+                     matched_pages=0,
+-                    remaining_ready_pages=ready_pages - consumed_pages,
++                    remaining_ready_pages=(
++                        ready_pages - plan_offset_pages - consumed_pages
++                    ),
++                    plan_offset_pages=plan_offset_pages,
++                    alignment_candidates=1,
+                 )
+                 break
+             next_pages = consumed_pages + len(node_hashes)
+-            if next_pages > ready_pages:
++            if plan_offset_pages + next_pages > ready_pages:
+                 _record_failure(
+                     "node_exceeds_ready_prefix",
+                     ready_pages=ready_pages,
+@@ -2399,10 +2506,16 @@
+                     failure_node_pages=len(node_hashes),
+                     consumed_pages=consumed_pages,
+                     matched_pages=0,
+-                    remaining_ready_pages=ready_pages - consumed_pages,
++                    remaining_ready_pages=(
++                        ready_pages - plan_offset_pages - consumed_pages
++                    ),
++                    plan_offset_pages=plan_offset_pages,
++                    alignment_candidates=1,
+                 )
+                 break
+-            operation_hashes = operation.hash_value[consumed_pages:next_pages]
++            operation_hashes = operation.hash_value[
++                plan_offset_pages + consumed_pages : plan_offset_pages + next_pages
++            ]
+             if operation_hashes != node_hashes:
+                 matched_pages = 0
+                 for operation_hash, node_hash in zip(operation_hashes, node_hashes):
+@@ -2418,7 +2531,11 @@
+                     failure_node_pages=len(node_hashes),
+                     consumed_pages=consumed_pages,
+                     matched_pages=matched_pages,
+-                    remaining_ready_pages=ready_pages - consumed_pages,
++                    remaining_ready_pages=(
++                        ready_pages - plan_offset_pages - consumed_pages
++                    ),
++                    plan_offset_pages=plan_offset_pages,
++                    alignment_candidates=1,
+                 )
+                 break
+             consumed_pages = next_pages
+@@ -2430,6 +2547,8 @@
+                 path_nodes=path_nodes,
+                 path_pages=path_pages,
+                 consumed_pages=consumed_pages,
++                plan_offset_pages=plan_offset_pages,
++                alignment_candidates=1,
+             )
+         return ready_node
+ 
+@@ -5704,6 +5823,7 @@
+             kv_batch_atomic_group_lens: list[int] = []
+             kv_batch_nodes: list[UnifiedTreeNode] = []
+             kv_plan_ptr: int | None = None
++            kv_plan_offset_pages = 0
+             kv_gpu_staging_lease = None
+             mamba_plan_ptr: int | None = None
+             ready_prefetch_operation: _FluxonHostlessPrefetchOperation | None = None
+@@ -5782,6 +5902,9 @@
+                         kv_batch_hash_values,
+                         exact=False,
+                     ):
++                        kv_plan_offset_pages = int(
++                            ready_prefetch_operation.kv_plan_offset_pages
++                        )
+                         kv_plan_ptr = ready_prefetch_operation.kv_plan_ptr
+                         ready_prefetch_operation.kv_plan_ptr = None
+                         if kv_plan_ptr is None:
+@@ -5797,10 +5920,13 @@
+                                     "Fluxon ready GPU restore lost its staging lease"
+                                 )
+                             remote_pages = sum(
+-                                index < len(kv_batch_hash_values)
++                                kv_plan_offset_pages
++                                <= index
++                                < kv_plan_offset_pages + len(kv_batch_hash_values)
+                                 for index in ready_prefetch_operation.gpu_remote_indices
+                             )
+-                            staging_lease.trim_after_transfer(remote_pages)
++                            if kv_plan_offset_pages == 0:
++                                staging_lease.trim_after_transfer(remote_pages)
+                             kv_gpu_staging_lease = staging_lease
+                             ready_prefetch_operation.gpu_staging_lease = None
+                     else:
+@@ -6007,9 +6133,13 @@
+                         if layerwise_async:
+                             queued_page_indices = page_indices
+                         else:
+-                            ordered_value_ptrs = backend.view_value_ptrs(
+-                                kv_plan_ptr,
+-                                int(page_indices.numel()),
++                            ordered_value_ptrs = (
++                                self._fluxon_hostless_ready_value_ptrs(
++                                    backend,
++                                    kv_plan_ptr,
++                                    ready_prefetch_operation,
++                                    int(page_indices.numel()),
++                                )
+                             )
+                             ordered_plan_blob = torch.empty(
+                                 len(ordered_value_ptrs) + 2,
+@@ -6159,8 +6289,10 @@
+                         raise RuntimeError(
+                             "Fluxon layerwise restore is missing its queued source"
+                         )
+-                    value_ptrs = backend.view_value_ptrs(
++                    value_ptrs = self._fluxon_hostless_ready_value_ptrs(
++                        backend,
+                         kv_plan_ptr,
++                        ready_prefetch_operation,
+                         int(queued_page_indices.numel()),
+                     )
+                     operation = _FluxonHostlessLayerwiseLoad(
+@@ -8191,7 +8323,8 @@
+                         "last_device_node=%d ready_pages=%d path_nodes=%d "
+                         "path_pages=%d failure_node_index=%d "
+                         "failure_node_pages=%d consumed_pages=%d "
+-                        "matched_pages=%d remaining_ready_pages=%d",
++                        "matched_pages=%d remaining_ready_pages=%d "
++                        "plan_offset_pages=%d alignment_candidates=%d",
+                         req.rid,
+                         ready_failure_shape.get("reason", "unobserved"),
+                         int(getattr(ready_operation, "anchor_node_id", -1)),
+@@ -8205,6 +8338,8 @@
+                         int(ready_failure_shape.get("consumed_pages", 0)),
+                         int(ready_failure_shape.get("matched_pages", 0)),
+                         int(ready_failure_shape.get("remaining_ready_pages", 0)),
++                        int(ready_failure_shape.get("plan_offset_pages", 0)),
++                        int(ready_failure_shape.get("alignment_candidates", 0)),
+                     )
+                     stale_operation = self.fluxon_hostless_ready_prefetch.pop(req.rid)
+                     assert stale_operation is ready_operation, (
+@@ -8225,6 +8360,29 @@
+                         self._empty_match_result.device_indices,
+                         last_best_match_device_node,
+                     )
++                if ready_operation.kv_plan_offset_pages > 0:
++                    aligned_pages = len(
++                        self._node_hash_values_after_ancestor(
++                            ready_node,
++                            last_best_match_device_node,
++                        )
++                    )
++                    logger.info(
++                        "Fluxon ready restore suffix aligned: req=%s "
++                        "plan_anchor_node=%d current_anchor_node=%d "
++                        "last_device_node=%d plan_offset_pages=%d "
++                        "aligned_pages=%d ready_pages=%d",
++                        req.rid,
++                        int(getattr(ready_operation, "anchor_node_id", -1)),
++                        int(getattr(best_match_node, "id", -1)),
++                        int(getattr(last_best_match_device_node, "id", -1)),
++                        int(ready_operation.kv_plan_offset_pages),
++                        aligned_pages,
++                        min(
++                            len(ready_operation.hash_value),
++                            ready_operation.completed_tokens // self.page_size,
++                        ),
++                    )
+                 restore_match_node = ready_node
+                 partial_ready_restore = restore_match_node is not best_match_node
+ 

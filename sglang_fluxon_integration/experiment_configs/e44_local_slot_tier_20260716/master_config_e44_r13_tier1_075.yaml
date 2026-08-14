@@ -1,0 +1,29 @@
+etcd_endpoints:
+- "10.233.114.129:34579"
+cluster_name: "fluxon-sglang-l13-single"
+instance_key: "sglang_l13_master"
+port: 50051
+monitoring:
+  prometheus_base_url: "http://10.233.114.129:4010/v1/prometheus"
+  prom_remote_write_url:
+  - "http://10.233.114.129:4010/v1/prometheus/write"
+  otlp_log_api:
+    otlp_endpoint: "http://10.233.114.129:4010/v1/otlp/v1/logs"
+master_ui:
+  http_listen_addr: "0.0.0.0:50161"
+network:
+  subnet_whitelist:
+  - "10.233.0.0/16"
+log_dir: "/storage/mjq/sglang_fluxon/fluxon_f1/services/master_logs_e44_r13_tier1_075_20260718"
+replica_task_placement:
+  policy: "bounded_role_queue_aware"
+  active_node_roles: ["prefill", "decode"]
+  remote_only_node_roles: ["remote_cache"]
+  restrict_to_remote_only_node_roles: true
+  remote_only_shard_weight: 1.02
+replica_cache_capacity_ratio: 0.95
+replica_writeback_tier1_capacity_ratio: 0.75
+test_spec_config:
+  disable_observability: true
+  user_rpc_sync_handler_thread_count: 8
+

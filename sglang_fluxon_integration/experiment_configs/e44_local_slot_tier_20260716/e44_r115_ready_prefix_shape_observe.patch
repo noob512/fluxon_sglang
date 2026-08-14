@@ -1,0 +1,174 @@
+--- unified_radix_cache_e44_r114_ready_prefetch_release.py
++++ unified_radix_cache_e44_r115_ready_prefix_shape_observe.py
+@@ -2308,6 +2308,7 @@
+         operation: _FluxonHostlessPrefetchOperation,
+         best_match_node: UnifiedTreeNode,
+         last_device_node: UnifiedTreeNode,
++        failure_shape: dict[str, Any] | None = None,
+     ) -> UnifiedTreeNode | None:
+         """Return the deepest whole radix-node prefix covered by a ready plan.
+ 
+@@ -2316,35 +2317,120 @@
+         atomic group, so recovery must stop between nodes rather than split a
+         node merely to consume every transferable page.
+         """
++        def _record_failure(reason: str, **fields: Any) -> None:
++            if failure_shape is None:
++                return
++            failure_shape.clear()
++            failure_shape.update(reason=reason, **fields)
++
+         if operation.kv_plan_ptr is None or not operation.hash_value:
++            _record_failure(
++                "invalid_plan",
++                ready_pages=0,
++                path_nodes=0,
++                path_pages=0,
++            )
+             return None
+ 
+         reverse_path: list[UnifiedTreeNode] = []
+         cursor = best_match_node
+         while cursor is not last_device_node:
+             if cursor is self.root_node or cursor.parent is None:
++                _record_failure(
++                    "device_anchor_not_ancestor",
++                    ready_pages=min(
++                        len(operation.hash_value),
++                        operation.completed_tokens // self.page_size,
++                    ),
++                    path_nodes=len(reverse_path),
++                    path_pages=sum(len(node.key) for node in reverse_path)
++                    // self.page_size,
++                )
+                 return None
+             reverse_path.append(cursor)
+             cursor = cursor.parent
+ 
+         completed_pages = operation.completed_tokens // self.page_size
+         ready_pages = min(len(operation.hash_value), completed_pages)
++        path_nodes = len(reverse_path)
++        path_pages = sum(len(node.key) for node in reverse_path) // self.page_size
+         if ready_pages <= 0:
++            _record_failure(
++                "zero_ready_pages",
++                ready_pages=ready_pages,
++                path_nodes=path_nodes,
++                path_pages=path_pages,
++            )
++            return None
++        if not reverse_path:
++            _record_failure(
++                "no_restore_path",
++                ready_pages=ready_pages,
++                path_nodes=0,
++                path_pages=0,
++            )
+             return None
+ 
+         consumed_pages = 0
+         ready_node: UnifiedTreeNode | None = None
+-        for node in reversed(reverse_path):
++        for node_index, node in enumerate(reversed(reverse_path)):
+             node_hashes = self._node_hash_values(node)
+             if not node_hashes:
++                _record_failure(
++                    "empty_node_hashes",
++                    ready_pages=ready_pages,
++                    path_nodes=path_nodes,
++                    path_pages=path_pages,
++                    failure_node_index=node_index,
++                    failure_node_pages=len(node.key) // self.page_size,
++                    consumed_pages=consumed_pages,
++                    matched_pages=0,
++                    remaining_ready_pages=ready_pages - consumed_pages,
++                )
+                 break
+             next_pages = consumed_pages + len(node_hashes)
+             if next_pages > ready_pages:
++                _record_failure(
++                    "node_exceeds_ready_prefix",
++                    ready_pages=ready_pages,
++                    path_nodes=path_nodes,
++                    path_pages=path_pages,
++                    failure_node_index=node_index,
++                    failure_node_pages=len(node_hashes),
++                    consumed_pages=consumed_pages,
++                    matched_pages=0,
++                    remaining_ready_pages=ready_pages - consumed_pages,
++                )
+                 break
+-            if operation.hash_value[consumed_pages:next_pages] != node_hashes:
++            operation_hashes = operation.hash_value[consumed_pages:next_pages]
++            if operation_hashes != node_hashes:
++                matched_pages = 0
++                for operation_hash, node_hash in zip(operation_hashes, node_hashes):
++                    if operation_hash != node_hash:
++                        break
++                    matched_pages += 1
++                _record_failure(
++                    "node_hash_mismatch",
++                    ready_pages=ready_pages,
++                    path_nodes=path_nodes,
++                    path_pages=path_pages,
++                    failure_node_index=node_index,
++                    failure_node_pages=len(node_hashes),
++                    consumed_pages=consumed_pages,
++                    matched_pages=matched_pages,
++                    remaining_ready_pages=ready_pages - consumed_pages,
++                )
+                 break
+             consumed_pages = next_pages
+             ready_node = node
++        if ready_node is None and failure_shape is not None and not failure_shape:
++            _record_failure(
++                "no_whole_node_unknown",
++                ready_pages=ready_pages,
++                path_nodes=path_nodes,
++                path_pages=path_pages,
++                consumed_pages=consumed_pages,
++            )
+         return ready_node
+ 
+     def _full_kv_pool(self):
+@@ -8091,12 +8177,35 @@
+         if self._is_fluxon_hostless_full_mode():
+             ready_operation = self.fluxon_hostless_ready_prefetch.get(req.rid)
+             if ready_operation is not None and ready_operation.hash_value:
++                ready_failure_shape: dict[str, Any] = {}
+                 ready_node = self._fluxon_hostless_longest_ready_restore_node(
+                     ready_operation,
+                     best_match_node,
+                     last_best_match_device_node,
++                    failure_shape=ready_failure_shape,
+                 )
+                 if ready_node is None:
++                    logger.info(
++                        "Fluxon ready restore failure shape: req=%s reason=%s "
++                        "plan_anchor_node=%d current_anchor_node=%d "
++                        "last_device_node=%d ready_pages=%d path_nodes=%d "
++                        "path_pages=%d failure_node_index=%d "
++                        "failure_node_pages=%d consumed_pages=%d "
++                        "matched_pages=%d remaining_ready_pages=%d",
++                        req.rid,
++                        ready_failure_shape.get("reason", "unobserved"),
++                        int(getattr(ready_operation, "anchor_node_id", -1)),
++                        int(getattr(best_match_node, "id", -1)),
++                        int(getattr(last_best_match_device_node, "id", -1)),
++                        int(ready_failure_shape.get("ready_pages", 0)),
++                        int(ready_failure_shape.get("path_nodes", 0)),
++                        int(ready_failure_shape.get("path_pages", 0)),
++                        int(ready_failure_shape.get("failure_node_index", -1)),
++                        int(ready_failure_shape.get("failure_node_pages", 0)),
++                        int(ready_failure_shape.get("consumed_pages", 0)),
++                        int(ready_failure_shape.get("matched_pages", 0)),
++                        int(ready_failure_shape.get("remaining_ready_pages", 0)),
++                    )
+                     stale_operation = self.fluxon_hostless_ready_prefetch.pop(req.rid)
+                     assert stale_operation is ready_operation, (
+                         "Fluxon ready-prefetch identity changed during one scheduler turn"
+@@ -8654,4 +8763,3 @@
+                     if cd.host_value is not None:
+                         self.host_lru_lists[ct].insert_mru(node)
+             stack.extend(node.children.values())
+-

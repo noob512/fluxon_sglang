@@ -1,0 +1,66 @@
+{
+  "schema": "mooncake_local_dram_capacity_expected_v2",
+  "status": "expected_not_measured",
+  "local_total_bytes": 274877906944,
+  "mooncake_remote_segment_bytes": 274877906944,
+  "page_bytes_per_rank": 4718592,
+  "topology": {
+    "instance0": {"tp_size": 2, "gpus": [0, 1], "port": 31001},
+    "instance1": {"tp_size": 2, "gpus": [2, 3], "port": 31002},
+    "router_port": 32000,
+    "router_worker_hosts": ["127.0.0.1", "127.0.0.1"]
+  },
+  "groups": {
+    "A": {
+      "hicache_size_gb_per_rank": 16,
+      "hicache_rank_bytes": [16000745472, 16000745472, 16000745472, 16000745472],
+      "hicache_total_bytes": 64002981888,
+      "mooncake_local_instance_segment_bytes": [105437462528, 105437462528],
+      "mooncake_local_segment_bytes": 210874925056
+    },
+    "B": {
+      "hicache_size_gb_per_rank": 32,
+      "hicache_rank_bytes": [32001490944, 32001490944, 32001490944, 32001490944],
+      "hicache_total_bytes": 128005963776,
+      "mooncake_local_instance_segment_bytes": [73435971584, 73435971584],
+      "mooncake_local_segment_bytes": 146871943168
+    },
+    "C": {
+      "hicache_size_gb_per_rank": 48,
+      "hicache_rank_bytes": [48002236416, 48002236416, 48002236416, 48002236416],
+      "hicache_total_bytes": 192008945664,
+      "mooncake_local_instance_segment_bytes": [41434480640, 41434480640],
+      "mooncake_local_segment_bytes": 82868961280
+    },
+    "D": {
+      "hicache_size_gb_per_rank": 0,
+      "hicache_ratio": 4.65984,
+      "hicache_rank_pages": [14563, 14563, 14563, 14563],
+      "hicache_rank_bytes": [68716855296, 68716855296, 68716855296, 68716855296],
+      "hicache_total_bytes": 274867421184,
+      "mooncake_local_instance_segment_bytes": [0, 0],
+      "mooncake_local_segment_bytes": 0,
+      "local_payload_bytes": 274867421184,
+      "page_alignment_slack_bytes": 10485760
+    },
+    "E": {
+      "engine": "vllm-0.24.0+lmcache-0.5.2+mooncake-0.3.11.post1",
+      "lmcache_chunk_tokens": 512,
+      "lmcache_chunk_bytes_per_rank": 37748736,
+      "lmcache_rank_configured_bytes": [68702698496, 68702698496, 68702698496, 68702698496],
+      "lmcache_rank_usable_bytes": [68664950784, 68664950784, 68664950784, 68664950784],
+      "lmcache_rank_alignment_slack_bytes": [37747712, 37747712, 37747712, 37747712],
+      "lmcache_total_configured_bytes": 274810793984,
+      "lmcache_total_usable_bytes": 274659803136,
+      "lmcache_total_alignment_slack_bytes": 150990848,
+      "mooncake_local_rank_segment_bytes": [16777216, 16777216, 16777216, 16777216],
+      "mooncake_local_segment_bytes": 67108864,
+      "mooncake_local_rank_buffer_bytes": [1024, 1024, 1024, 1024],
+      "mooncake_local_buffer_bytes": 4096,
+      "mooncake_local_kv_usable_bytes": 0,
+      "mooncake_local_protocol_only": true,
+      "local_total_bytes": 274877906944
+    }
+  },
+  "note": "These are same-host TP2x2 expectations. D uses zero local Mooncake payload and the largest symmetric whole-page HiCache capacity not exceeding the fixed 256 GiB physical budget. E gives each rank Mooncake's measured allocator minimum 16-MiB global segment and 1024-byte internal transfer buffer, then subtracts both from its LMCache allocator, so LMCache plus Mooncake remains exactly 256 GiB. The global segment is smaller than one 37,748,736-byte KV chunk and prefer_local_alloc is false, so it cannot form a usable local Mooncake KV tier. Same-host metadata/master control uses loopback while local_hostname continues to advertise the private RDMA address. Formal replay requires a final_measured manifest generated from runtime logs and metrics."
+}

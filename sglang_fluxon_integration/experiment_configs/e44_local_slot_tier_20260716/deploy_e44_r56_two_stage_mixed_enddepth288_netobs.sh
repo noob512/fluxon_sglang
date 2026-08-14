@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# r56 changes only the isolated SGLang runtime/adapter/scheduler sources.  Reuse
+# the sealed r55 Fluxon wheel/release byte-for-byte; the shared-stage deployer
+# still performs independent manifest/ABI/runtime verification on every node.
+export E44_DEPLOY_GPU_RELEASE=/mnt/nvme0/mjq_build/fluxon_e44_r55_planned_get_cancel_safe_gpu_cuda_20260723
+export E44_DEPLOY_CPU_RELEASE=/mnt/nvme0/mjq_build/fluxon_e44_r55_planned_get_cancel_safe_cpu_host_20260723
+export E44_DEPLOY_GPU_REMOTE_RELEASE=/storage/mjq/sglang_fluxon/releases/fluxon_e44_r55_planned_get_cancel_safe_gpu_20260723
+export E44_DEPLOY_CPU_REMOTE_RELEASE=/storage/mjq/sglang_fluxon/releases/fluxon_e44_r55_planned_get_cancel_safe_cpu_20260723
+export E44_DEPLOY_GPU_VENV=/storage/zth/sglang_l13_fluxon_v2/venv-fluxon-e44-r55-planned-get-cancel-safe-gpu-20260723
+export E44_DEPLOY_CPU_VENV=/storage/mjq/sglang_fluxon/fluxon_cpu/venv-fluxon-e44-r55-planned-get-cancel-safe-cpu-20260723
+export E44_DEPLOY_VARIANT=tier1_independent_005_netobs_enddepth288_gpu_direct_r56_two_stage_mixed
+export E44_DEPLOY_MASTER_CONFIG=master_config_e44_r54_prefetch_timeline_enddepth288_netobs.yaml
+export E44_DEPLOY_SSH_IDENTITY="${E44_DEPLOY_SSH_IDENTITY:-/home/zyc/.ssh/infra44_ed25519}"
+export E44_DEPLOY_RADIX_SOURCE=unified_radix_cache_e44_r54_prefetch_timeline_observe.py
+export E44_DEPLOY_ADAPTER_SOURCE=hicache_fluxon_e44_r54_prefetch_timeline_observe.py
+export E44_DEPLOY_SCHEDULER_SOURCE=scheduler_e44_r54_prefetch_timeline_observe.py
+export E44_DEPLOY_TIMELINE_VALIDATOR=validate_e44_r56_two_stage_mixed_materialization.py
+export E44_DEPLOY_EXPECTED_RADIX_SHA256=1b259dd9ad85f4bc74589fa300d0d0830671e041ee9946437661e14775f079a2
+export E44_DEPLOY_EXPECTED_ADAPTER_SHA256=9912aff219063295905bad67ba28a622683570abf49b71f5125c2b2d553133f7
+export E44_DEPLOY_EXPECTED_SCHEDULER_SHA256=5b45664cf20587938eaa062fb11fa62652e74cde51dbba2f88f90c02bdae8060
+
+exec bash "$script_dir/deploy_e44_r47_gpu_direct_full_enddepth288_netobs.sh" "$@"

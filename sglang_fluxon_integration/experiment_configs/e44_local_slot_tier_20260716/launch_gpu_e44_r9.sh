@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="${1:?missing fluxon root}"
+node="${2:?missing node label}"
+case "$node" in node0|node1) ;; *) exit 2 ;; esac
+
+site=/storage/zth/sglang_l13_fluxon_v2/venv-zth/lib/python3.10/site-packages
+test "$(sha256sum "$site/sglang/srt/mem_cache/storage/fluxon/hicache_fluxon.py" | awk '{print $1}')" = 776d990f879dae2a9c543275fe3fefb623e11a73ea51792edafc7e5fd58d0e9e
+test "$(sha256sum "$site/sglang/srt/mem_cache/unified_radix_cache.py" | awk '{print $1}')" = 72d3c7be4b71a90e5b04b944b387f9d549f3baa3a68cd4cd00703a2cd488dbee
+test "$(sha256sum "$site/sglang/srt/mem_cache/unified_cache_components/full_component.py" | awk '{print $1}')" = 6775c5b926a7c3329a9f7f8d1d8182de5e0d3d628d5503a2b702b5b9931b3f8e
+
+export ROOT_DIR="$root"
+export FLUXON_NODE0_IP=10.233.114.129 FLUXON_NODE1_IP=10.233.111.134 FLUXON_NODE2_IP=10.233.125.121
+export FLUXON_EXTERNAL_VENV_DIR=/storage/zth/sglang_l13_fluxon_v2/venv-fluxon-e44-r9-20260717
+export FLUXON_EXTERNAL_OWNER_DRAM_BYTES=137438953472
+export FLUXON_EXTERNAL_RDMA_DEVICE_0=mlx5_4 FLUXON_EXTERNAL_RDMA_DEVICE_1=mlx5_6
+export FLUXON_EXTERNAL_REPLICA_WRITEBACK_HOT_CAPACITY_RATIO=0.90
+unset FLUXON_EXTERNAL_OMIT_OWNER_HOT_CAPACITY_RATIO
+export FLUXON_EXTERNAL_OWNER_LOCAL_RESERVE_VALUE_LEN=4718592
+export FLUXON_EXTERNAL_OWNER_LOCAL_RESERVE_PAYLOAD_CAPACITY_BYTES=123695058124
+export FLUXON_EXTERNAL_CLEAN_START=1
+export FLUXON_EXTERNAL_OWNER_SESSION="zth_fluxon_owner_e44_r9_${node}"
+export SGLANG_EXTERNAL_SESSION="zth_sglang_e44_r9_${node}_tp2"
+export SGLANG_EXTERNAL_LOG_SUFFIX=_e44_r9_20260717
+export SGLANG_EXTERNAL_HICACHE_KEY_PREFIX=fluxon_external_e44_r9_20260717
+export SGLANG_EXTERNAL_HICACHE_SIZE_GB=32 SGLANG_EXTERNAL_HICACHE_WRITE_POLICY=write_back
+export SGLANG_EXTERNAL_HICACHE_PREFETCH_THRESHOLD=256 SGLANG_EXTERNAL_HICACHE_BATCH_CONCURRENCY=32
+export SGLANG_EXTERNAL_BATCH_EXISTS_PIN_TTL_MS=1200 SGLANG_EXTERNAL_MAX_TOTAL_TOKENS=200000
+export SGLANG_EXTERNAL_PAGE_SIZE=64 SGLANG_EXTERNAL_MEM_FRACTION_STATIC=0.50
+export SGLANG_EXTERNAL_DISABLE_OVERLAP_SCHEDULE=0 SGLANG_EXTERNAL_DISABLE_CUDA_GRAPH=0
+export FLUXON_EXTERNAL_DISABLE_OBSERVABILITY=true FLUXON_EXTERNAL_ICEORYX_EXTERNAL_BUSY_POLL=true FLUXON_EXTERNAL_ICEORYX_OWNER_CLIENT_BUSY_POLL=true
+export FLUXON_EXTERNAL_EXPECTED_PYO3_SHA256=1ed69cf9f33924d42d32a9fb8dea46dede62167b15c1ff83b5c4b58352941e2d
+export FLUXON_EXTERNAL_EXPECTED_COMMU_CORE_SHA256=bfa6a32d991f6b6adf0f5175c07ed7da8290d1ed2a7ef4148b3a5f8b13452503
+export FLUXON_EXTERNAL_EXPECTED_RDMA_PROBE_SHA256=e925553e01d6f5f2754e667aeeac9bba8e7d829bf15136a95304f221e5dc5883
+export FLUXON_EXTERNAL_REPLICA_TASK_MAX_INFLIGHT=64
+export FLUXON_EXTERNAL_USER_RPC_SYNC_HANDLER_THREAD_COUNT=8
+export SGLANG_EXTERNAL_REPLICA_TASK_CONFIG_JSON='{"hicache_storage_pass_prefix_keys":true,"replica_task":{"enabled":true,"admission":{"policy":"prefix_depth_ratio","admission_ratio":1.0,"min_replica_pages":8,"max_replica_pages_per_batch":160},"metrics_sample_interval_ms":1000}}'
+export SGLANG_FLUXON_HOSTLESS_PAGE_INDEX_VALIDATE_EVERY_N=0
+export SGLANG_FLUXON_HOSTLESS_EVICTION_WRITE_STREAM=1 SGLANG_FLUXON_HOSTLESS_LAYER_BATCH_DMA=1 SGLANG_FLUXON_HOSTLESS_BACKGROUND_DMA_SUBMIT=1
+export RUST_LOG=info
+
+tmux set-environment -g SGLANG_FLUXON_HOSTLESS_EVICTION_WRITE_STREAM 1 2>/dev/null || true
+tmux set-environment -g SGLANG_FLUXON_HOSTLESS_LAYER_BATCH_DMA 1 2>/dev/null || true
+tmux set-environment -g SGLANG_FLUXON_HOSTLESS_BACKGROUND_DMA_SUBMIT 1 2>/dev/null || true
+exec bash "$root/experiment_e16bb_rdma_numa1_20260714/start_gpu_stack_owner_numa1.sh"

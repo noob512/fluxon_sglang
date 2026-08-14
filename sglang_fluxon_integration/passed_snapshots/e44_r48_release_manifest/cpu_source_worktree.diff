@@ -1,0 +1,3541 @@
+diff --git a/fluxon_py/__init__.py b/fluxon_py/__init__.py
+index 753281c..7c57441 100644
+--- a/fluxon_py/__init__.py
++++ b/fluxon_py/__init__.py
+@@ -66,6 +66,9 @@ __all__ = [
+     "KvFuture",
+     "MemHolder",
+     "FluxonMemHolder",
++    "GpuBufferRegistration",
++    "GpuDestination",
++    "GpuGetStartHandle",
+     # Backend management
+     "KvClientType",
+     "new_store",
+@@ -148,6 +151,9 @@ _LAZY_API_EXT_CHAN = {
+ 
+ _LAZY_PYO3 = {
+     "FluxonMemHolder": ("kvclient.fluxon", "FluxonMemHolder"),
++    "GpuBufferRegistration": ("kvclient.fluxon", "GpuBufferRegistration"),
++    "GpuDestination": ("kvclient.fluxon", "GpuDestination"),
++    "GpuGetStartHandle": ("kvclient.fluxon", "GpuGetStartHandle"),
+ }
+ 
+ 
+diff --git a/fluxon_py/kvclient/fluxon.py b/fluxon_py/kvclient/fluxon.py
+index ef17660..1602e88 100644
+--- a/fluxon_py/kvclient/fluxon.py
++++ b/fluxon_py/kvclient/fluxon.py
+@@ -224,6 +224,78 @@ class _RegisteredBufferDescriptor:
+         }
+ 
+ 
++@dataclass(frozen=True)
++class GpuBufferRegistration:
++    registration_id: int
++    ptr: int
++    size: int
++    device_id: int
++
++    def __post_init__(self) -> None:
++        if type(self.registration_id) is not int or self.registration_id <= 0:
++            raise ValueError("registration_id must be a positive int")
++        if type(self.ptr) is not int or self.ptr <= 0:
++            raise ValueError("GPU registration ptr must be a positive int")
++        if type(self.size) is not int or self.size <= 0:
++            raise ValueError("GPU registration size must be a positive int")
++        if type(self.device_id) is not int or self.device_id < 0:
++            raise ValueError("GPU device_id must be a non-negative int")
++        if self.end > (1 << 64):
++            raise ValueError("GPU registration range overflows u64")
++
++    @property
++    def end(self) -> int:
++        return self.ptr + self.size
++
++    def destination(self, ptr: int, capacity: int) -> "GpuDestination":
++        destination = GpuDestination(
++            registration_id=self.registration_id,
++            ptr=ptr,
++            capacity=capacity,
++        )
++        if destination.ptr < self.ptr or destination.end > self.end:
++            raise ValueError(
++                "GPU destination is outside its registration: "
++                f"registration=[{self.ptr:#x},{self.end:#x}) "
++                f"destination=[{destination.ptr:#x},{destination.end:#x})"
++            )
++        return destination
++
++
++@dataclass(frozen=True)
++class GpuDestination:
++    registration_id: int
++    ptr: int
++    capacity: int
++
++    def __post_init__(self) -> None:
++        if type(self.registration_id) is not int or self.registration_id <= 0:
++            raise ValueError("registration_id must be a positive int")
++        if type(self.ptr) is not int or self.ptr <= 0:
++            raise ValueError("GPU destination ptr must be a positive int")
++        if type(self.capacity) is not int or self.capacity <= 0:
++            raise ValueError("GPU destination capacity must be a positive int")
++        if self.end > (1 << 64):
++            raise ValueError("GPU destination range overflows u64")
++
++    @property
++    def end(self) -> int:
++        return self.ptr + self.capacity
++
++
++@dataclass
++class GpuGetStartHandle:
++    """One-shot handle for a background RDMA pull into GPU staging."""
++
++    keys: Tuple[str, ...]
++    destinations: Tuple[GpuDestination, ...]
++    result: GetStartResult
++    created_at_ns: int
++    backend_token: int
++    backend_handle: int
++    closed: bool = False
++
++
+ def _map_nospace_to_storagefull(err: ApiError) -> ApiError:
+     """Normalize storage-capacity errors without depending on backend internals."""
+     return err
+@@ -461,6 +533,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
+         self._config = config
+         self._init_error: Optional[ApiError] = None
+         self._registered_buffer_descriptors: List[_RegisteredBufferDescriptor] = []
++        self._gpu_buffer_registration: Optional[GpuBufferRegistration] = None
+         cluster_name = config.fluxonkv_spec_cluster_name
+         self._batch_concurrency = 128
+         if self._batch_concurrency <= 0:
+@@ -997,6 +1070,15 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
+                     message=f"device_kind must be str; got {type(device_kind)}"
+                 )
+             )
++        if device_kind.strip().lower() != "host":
++            return Result.new_error(
++                InvalidArgumentError(
++                    message=(
++                        "register_buffer supports host memory only; "
++                        "use register_gpu_buffer for a CUDA staging range"
++                    )
++                )
++            )
+         if not isinstance(device_id, str):
+             return Result.new_error(
+                 InvalidArgumentError(
+@@ -1034,6 +1116,164 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
+         except ApiError as e:
+             return Result.new_error(e)
+ 
++    def register_gpu_buffer(
++        self,
++        ptr: int,
++        size: int,
++        device_id: int,
++    ) -> Result[GpuBufferRegistration, ApiError]:
++        if self._client is None:
++            return Result.new_error(
++                GeneralError(
++                    message="Store not initialized when register_gpu_buffer(). Call setup() first."
++                )
++            )
++        if isinstance(ptr, bool) or not isinstance(ptr, int) or ptr <= 0:
++            return Result.new_error(
++                InvalidArgumentError(message=f"GPU ptr must be a positive int; got {ptr!r}")
++            )
++        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
++            return Result.new_error(
++                InvalidArgumentError(message=f"GPU size must be a positive int; got {size!r}")
++            )
++        if (
++            isinstance(device_id, bool)
++            or not isinstance(device_id, int)
++            or device_id < 0
++        ):
++            return Result.new_error(
++                InvalidArgumentError(
++                    message=f"GPU device_id must be a non-negative int; got {device_id!r}"
++                )
++            )
++        if ptr + size > (1 << 64):
++            return Result.new_error(
++                InvalidArgumentError(
++                    message=f"GPU registration range overflows u64: ptr={ptr:#x} size={size}"
++                )
++            )
++        if self._gpu_buffer_registration is not None:
++            return Result.new_error(
++                InvalidArgumentError(
++                    message=(
++                        "one GPU buffer is already registered: "
++                        f"registration_id={self._gpu_buffer_registration.registration_id}"
++                    )
++                )
++            )
++        try:
++            inner_res = self._client.register_gpu_buffer(ptr, size, device_id)
++            if not inner_res.is_ok():
++                return Result.new_error(inner_res.unwrap_error())
++            payload = inner_res.unwrap()
++            if not isinstance(payload, dict):
++                return Result.new_error(
++                    GeneralError(
++                        message=f"register_gpu_buffer returned non-dict payload: {type(payload)}"
++                    )
++                )
++            registration = GpuBufferRegistration(
++                registration_id=int(payload["registration_id"]),
++                ptr=int(payload["ptr"]),
++                size=int(payload["len"]),
++                device_id=int(payload["device_id"]),
++            )
++            if (
++                registration.registration_id <= 0
++                or registration.ptr != ptr
++                or registration.size != size
++                or registration.device_id != device_id
++            ):
++                return Result.new_error(
++                    GeneralError(
++                        message=(
++                            "register_gpu_buffer returned a mismatched registration: "
++                            f"{registration!r}"
++                        )
++                    )
++                )
++            self._gpu_buffer_registration = registration
++            return Result.new_ok(registration)
++        except ApiError as e:
++            return Result.new_error(e)
++
++    def validate_gpu_destination(
++        self,
++        destination: GpuDestination,
++    ) -> Result[OkNone, ApiError]:
++        if self._client is None:
++            return Result.new_error(
++                GeneralError(
++                    message="Store not initialized when validate_gpu_destination()."
++                )
++            )
++        if not isinstance(destination, GpuDestination):
++            return Result.new_error(
++                InvalidArgumentError(
++                    message=(
++                        "validate_gpu_destination requires GpuDestination; "
++                        f"got {type(destination)}"
++                    )
++                )
++            )
++        if destination.capacity <= 0 or destination.ptr <= 0:
++            return Result.new_error(
++                InvalidArgumentError(
++                    message=f"invalid GPU destination: {destination!r}"
++                )
++            )
++        try:
++            inner_res = self._client.validate_gpu_destination(
++                destination.registration_id,
++                destination.ptr,
++                destination.capacity,
++            )
++            if not inner_res.is_ok():
++                return Result.new_error(inner_res.unwrap_error())
++            _ = inner_res.unwrap()
++            return Result.new_ok(OkNone())
++        except ApiError as e:
++            return Result.new_error(e)
++
++    def unregister_gpu_buffer(
++        self,
++        registration: GpuBufferRegistration,
++    ) -> Result[OkNone, ApiError]:
++        if self._client is None:
++            return Result.new_error(
++                GeneralError(
++                    message="Store not initialized when unregister_gpu_buffer()."
++                )
++            )
++        if not isinstance(registration, GpuBufferRegistration):
++            return Result.new_error(
++                InvalidArgumentError(
++                    message=(
++                        "unregister_gpu_buffer requires GpuBufferRegistration; "
++                        f"got {type(registration)}"
++                    )
++                )
++            )
++        active = self._gpu_buffer_registration
++        if active != registration:
++            return Result.new_error(
++                InvalidArgumentError(
++                    message=(
++                        "GPU registration is not active on this store: "
++                        f"requested={registration!r} active={active!r}"
++                    )
++                )
++            )
++        try:
++            inner_res = self._client.unregister_gpu_buffer(registration.registration_id)
++            if not inner_res.is_ok():
++                return Result.new_error(inner_res.unwrap_error())
++            _ = inner_res.unwrap()
++            self._gpu_buffer_registration = None
++            return Result.new_ok(OkNone())
++        except ApiError as e:
++            return Result.new_error(e)
++
+     def batch_put_from(
+         self,
+         keys: List[str],
+@@ -1443,6 +1683,13 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
+     def close(self) -> Result[OkNone, ApiError]:
+         """Close and tear down the store."""
+         try:
++            if self._gpu_buffer_registration is not None:
++                unregister_result = self.unregister_gpu_buffer(
++                    self._gpu_buffer_registration
++                )
++                if not unregister_result.is_ok():
++                    return Result.new_error(unregister_result.unwrap_error())
++                _ = unregister_result.unwrap()
+             # Backend returns a Result; MUST be explicitly consumed to avoid
+             # leaking an unconsumed Result that triggers __del__ assertion.
+             res = self._client.close()
+@@ -1782,6 +2029,205 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
+             raise RuntimeError(f"get_transfer returned invalid plan_ptr: {plan_ptr!r}")
+         return int(plan_ptr)
+ 
++    def get_start_gpu(
++        self,
++        keys: List[str],
++        destinations: List[GpuDestination],
++        prefix_best_effort: bool = True,
++        atomic_group_lens: Optional[List[int]] = None,
++    ) -> GpuGetStartHandle:
++        """Start background remote reads directly into caller-owned GPU staging."""
++        if self._client is None:
++            raise RuntimeError(
++                "Store not initialized when get_start_gpu(). Call setup() first."
++            )
++        if len(keys) == 0:
++            raise ValueError("get_start_gpu requires at least one key")
++        if len(keys) != len(destinations):
++            raise ValueError(
++                "get_start_gpu requires one destination per key: "
++                f"keys={len(keys)} destinations={len(destinations)}"
++            )
++        active_registration = self._gpu_buffer_registration
++        if active_registration is None:
++            raise RuntimeError("get_start_gpu requires an active GPU registration")
++        for index, destination in enumerate(destinations):
++            if not isinstance(destination, GpuDestination):
++                raise TypeError(
++                    "get_start_gpu destinations must be GpuDestination: "
++                    f"index={index} got={type(destination)}"
++                )
++            if destination.registration_id != active_registration.registration_id:
++                raise ValueError(
++                    "get_start_gpu destination uses a stale registration: "
++                    f"index={index} destination_id={destination.registration_id} "
++                    f"active_id={active_registration.registration_id}"
++                )
++            if (
++                destination.ptr < active_registration.ptr
++                or destination.end > active_registration.end
++            ):
++                raise ValueError(
++                    "get_start_gpu destination is outside the active registration: "
++                    f"index={index} destination={destination!r} "
++                    f"registration={active_registration!r}"
++                )
++
++        normalized_group_lens: Optional[List[int]] = None
++        if atomic_group_lens is not None:
++            normalized_group_lens = [int(length) for length in atomic_group_lens]
++            if any(length <= 0 for length in normalized_group_lens):
++                raise ValueError("get_start_gpu atomic_group_lens entries must be > 0")
++            if sum(normalized_group_lens) != len(keys):
++                raise ValueError(
++                    "get_start_gpu atomic_group_lens must sum to keys length: "
++                    f"sum={sum(normalized_group_lens)} keys={len(keys)}"
++                )
++
++        started_at_ns = time.monotonic_ns()
++        inner_res = self._client.get_start_gpu(
++            list(keys),
++            [
++                (
++                    destination.registration_id,
++                    destination.ptr,
++                    destination.capacity,
++                )
++                for destination in destinations
++            ],
++            bool(prefix_best_effort),
++            normalized_group_lens,
++            self._batch_concurrency,
++        )
++        if not inner_res.is_ok():
++            raise RuntimeError(f"get_start_gpu backend error: {inner_res.unwrap_error()}")
++        payload = inner_res.unwrap()
++        if not isinstance(payload, dict):
++            raise RuntimeError(
++                f"get_start_gpu returned non-dict payload: {type(payload)}"
++            )
++        backend_handle = int(payload["handle"])
++        try:
++            result = _build_get_start_result_from_backend_payload(
++                payload,
++                list(keys),
++                bool(prefix_best_effort),
++                normalized_group_lens,
++            )
++        except Exception:
++            cancel_res = self._client.cancel_get_transfer_gpu(backend_handle)
++            if not cancel_res.is_ok():
++                logging.exception(
++                    "get_start_gpu payload validation failed and cleanup also failed: %s",
++                    cancel_res.unwrap_error(),
++                )
++            raise
++        return GpuGetStartHandle(
++            keys=tuple(keys),
++            destinations=tuple(destinations),
++            result=result,
++            created_at_ns=started_at_ns,
++            backend_token=id(self),
++            backend_handle=backend_handle,
++        )
++
++    def cancel_get_transfer_gpu(self, handle: GpuGetStartHandle) -> None:
++        if not isinstance(handle, GpuGetStartHandle):
++            raise TypeError(
++                f"cancel_get_transfer_gpu requires GpuGetStartHandle, got {type(handle)}"
++            )
++        if handle.backend_token != id(self):
++            raise RuntimeError(
++                "cancel_get_transfer_gpu handle belongs to a different FluxonKVCacheStore"
++            )
++        if handle.closed:
++            return
++        if self._client is None:
++            raise RuntimeError(
++                "Store not initialized when cancel_get_transfer_gpu(). Call setup() first."
++            )
++        inner_res = self._client.cancel_get_transfer_gpu(handle.backend_handle)
++        handle.closed = True
++        if not inner_res.is_ok():
++            raise RuntimeError(
++                f"cancel_get_transfer_gpu backend error: {inner_res.unwrap_error()}"
++            )
++
++    def get_transfer_gpu(
++        self,
++        handle: GpuGetStartHandle,
++        *,
++        consume_prefix_len: Optional[int] = None,
++    ) -> None:
++        """Wait for the GPU transfer terminal; destinations already contain the bytes."""
++        if not isinstance(handle, GpuGetStartHandle):
++            raise TypeError(
++                f"get_transfer_gpu requires GpuGetStartHandle, got {type(handle)}"
++            )
++        if handle.backend_token != id(self):
++            raise RuntimeError(
++                "get_transfer_gpu handle belongs to a different FluxonKVCacheStore"
++            )
++        if handle.closed:
++            raise RuntimeError("get_transfer_gpu handle has been closed")
++        result = handle.result
++        normalized_consume_prefix_len = (
++            result.transferable_len
++            if consume_prefix_len is None
++            else consume_prefix_len
++        )
++        if (
++            isinstance(normalized_consume_prefix_len, bool)
++            or not isinstance(normalized_consume_prefix_len, int)
++            or normalized_consume_prefix_len <= 0
++            or normalized_consume_prefix_len > result.transferable_len
++        ):
++            raise ValueError(
++                "get_transfer_gpu consume_prefix_len must be within the live prefix: "
++                f"consume={normalized_consume_prefix_len!r} "
++                f"transferable={result.transferable_len}"
++            )
++        group_lens = result.atomic_group_lens or (len(result.keys),)
++        group_end = 0
++        for group_len in group_lens:
++            group_end += int(group_len)
++            if group_end >= normalized_consume_prefix_len:
++                break
++        if group_end != normalized_consume_prefix_len:
++            raise ValueError(
++                "get_transfer_gpu consume_prefix_len must end at an atomic-group boundary: "
++                f"consume={normalized_consume_prefix_len} groups={group_lens}"
++            )
++        if self._client is None:
++            raise RuntimeError(
++                "Store not initialized when get_transfer_gpu(). Call setup() first."
++            )
++        inner_res = self._client.get_transfer_gpu(
++            handle.backend_handle,
++            normalized_consume_prefix_len,
++        )
++        handle.closed = True
++        if not inner_res.is_ok():
++            raise RuntimeError(
++                f"get_transfer_gpu backend error: {inner_res.unwrap_error()}"
++            )
++        payload = inner_res.unwrap()
++        if not isinstance(payload, dict):
++            raise RuntimeError(
++                f"get_transfer_gpu returned non-dict payload: {type(payload)}"
++            )
++        transferred_prefix_len = int(payload["transferred_prefix_len"])
++        consumed_prefix_len = int(payload["consumed_prefix_len"])
++        if (
++            transferred_prefix_len != result.transferable_len
++            or consumed_prefix_len != normalized_consume_prefix_len
++        ):
++            raise RuntimeError(
++                "get_transfer_gpu returned inconsistent terminal lengths: "
++                f"transferred={transferred_prefix_len}/{result.transferable_len} "
++                f"consumed={consumed_prefix_len}/{normalized_consume_prefix_len}"
++            )
++
+     def get_etcd_config(self) -> List[str]:
+         if self._client is None:
+             raise RuntimeError("Store not initialized")
+diff --git a/fluxon_rs/fluxon_commu/src/facade/transfer_engine.rs b/fluxon_rs/fluxon_commu/src/facade/transfer_engine.rs
+index e5353a5..f701659 100644
+--- a/fluxon_rs/fluxon_commu/src/facade/transfer_engine.rs
++++ b/fluxon_rs/fluxon_commu/src/facade/transfer_engine.rs
+@@ -7,6 +7,9 @@ use std::collections::HashMap;
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ 
+ use crate::NodeIDString;
++pub use fluxon_commu_contract::{
++    CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER, ClosedRuntimeLocalMemoryKind,
++};
+ use fluxon_commu_contract::{
+     ClosedRuntimeHandle, ClosedRuntimePeerGen, ClosedRuntimeTransferEngineOpenRuntimeRequest,
+     ClosedRuntimeTransferEngineOpenRuntimeResponse,
+@@ -377,6 +380,25 @@ impl ClientTransferEngineCore {
+         runtime: R,
+         cpu_mem: &CpuAllocatedMem,
+     ) -> TransferEngineResult<()>
++    where
++        R: ClientTransferEngineRuntime,
++    {
++        self.register_local_memory(
++            runtime,
++            cpu_mem.allocated_addr,
++            cpu_mem.allocated_size,
++            ClosedRuntimeLocalMemoryKind::Host,
++        )
++        .await
++    }
++
++    pub async fn register_local_memory<R>(
++        &self,
++        runtime: R,
++        allocated_addr: u64,
++        allocated_size: u64,
++        memory_kind: ClosedRuntimeLocalMemoryKind,
++    ) -> TransferEngineResult<()>
+     where
+         R: ClientTransferEngineRuntime,
+     {
+@@ -384,8 +406,9 @@ impl ClientTransferEngineCore {
+             let handle = self.ensure_closed_runtime_handle(&runtime).await?;
+             transfer_engine_register_local_segment(
+                 handle,
+-                cpu_mem.allocated_addr,
+-                cpu_mem.allocated_size,
++                allocated_addr,
++                allocated_size,
++                memory_kind,
+             )
+             .await
+             .map_err(transfer_engine_closed_sdk_error)
+@@ -395,13 +418,28 @@ impl ClientTransferEngineCore {
+     pub async fn unregister_local_segment(
+         &self,
+         cpu_mem: &CpuAllocatedMem,
++    ) -> TransferEngineResult<()> {
++        self.unregister_local_memory(
++            cpu_mem.allocated_addr,
++            cpu_mem.allocated_size,
++            ClosedRuntimeLocalMemoryKind::Host,
++        )
++        .await
++    }
++
++    pub async fn unregister_local_memory(
++        &self,
++        allocated_addr: u64,
++        allocated_size: u64,
++        memory_kind: ClosedRuntimeLocalMemoryKind,
+     ) -> TransferEngineResult<()> {
+         {
+             if let Some(handle) = self.closed.handle.get().copied() {
+                 transfer_engine_unregister_local_segment(
+                     handle,
+-                    cpu_mem.allocated_addr,
+-                    cpu_mem.allocated_size,
++                    allocated_addr,
++                    allocated_size,
++                    memory_kind,
+                 )
+                 .await
+                 .map_err(transfer_engine_closed_sdk_error)
+@@ -458,6 +496,7 @@ impl ClientTransferEngineCore {
+                 target_addr,
+                 len,
+                 seg_guard,
++                false,
+             )
+             .await
+         }
+@@ -472,6 +511,7 @@ impl ClientTransferEngineCore {
+         target_addr: u64,
+         len: u64,
+         seg_guard: Option<R::LocalSegmentGuard>,
++        require_fast_path: bool,
+     ) -> TransferEngineResult<TransferBreakdown>
+     where
+         R: ClientTransferEngineRuntime,
+@@ -506,6 +546,7 @@ impl ClientTransferEngineCore {
+                 target_addr,
+                 len,
+                 initial_local_segment_guard_handle,
++                require_fast_path,
+             )
+             .await
+             .map_err(transfer_engine_closed_sdk_error);
+diff --git a/fluxon_rs/fluxon_commu_closed_sdk_consumer/src/lib.rs b/fluxon_rs/fluxon_commu_closed_sdk_consumer/src/lib.rs
+index caad34b..7395347 100644
+--- a/fluxon_rs/fluxon_commu_closed_sdk_consumer/src/lib.rs
++++ b/fluxon_rs/fluxon_commu_closed_sdk_consumer/src/lib.rs
+@@ -13,7 +13,7 @@ use fluxon_commu_contract::{
+     ClosedRuntimeClusterRdmaResolvedConfigStreamItem, ClosedRuntimeDesiredTransferPeer,
+     ClosedRuntimeDispatchRequestView, ClosedRuntimeDispatchResponse,
+     ClosedRuntimeDispatchTransportPolicy, ClosedRuntimeError, ClosedRuntimeHandle,
+-    ClosedRuntimeHostCallbackHandle, ClosedRuntimeP2pCall,
++    ClosedRuntimeHostCallbackHandle, ClosedRuntimeLocalMemoryKind, ClosedRuntimeP2pCall,
+     ClosedRuntimeP2pCallRawObservedRequestView, ClosedRuntimeP2pResponse,
+     ClosedRuntimeP2pSendResponseRawRequestView, ClosedRuntimePeerGen, ClosedRuntimeRawSlice,
+     ClosedRuntimeRequest, ClosedRuntimeResponse, ClosedRuntimeTransferEngineCall,
+@@ -26,8 +26,8 @@ use fluxon_commu_contract::{
+ 
+ pub mod rdma_probe;
+ 
+-pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 5;
+-pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 8;
++pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 6;
++pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 9;
+ pub const FLUXON_COMMU_CLOSED_HOST_CALLBACKS_ABI_VERSION: u32 = 8;
+ pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK: i32 = 0;
+ pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_ERR: i32 = 1;
+@@ -1866,12 +1866,14 @@ pub async fn transfer_engine_register_local_segment(
+     handle: ClosedRuntimeHandle,
+     allocated_addr: u64,
+     allocated_size: u64,
++    memory_kind: ClosedRuntimeLocalMemoryKind,
+ ) -> Result<(), ClosedSdkConsumerError> {
+     match transfer_engine_call(
+         handle,
+         ClosedRuntimeTransferEngineCall::RegisterLocalSegment {
+             allocated_addr,
+             allocated_size,
++            memory_kind,
+         },
+     )
+     .await?
+@@ -1887,12 +1889,14 @@ pub async fn transfer_engine_unregister_local_segment(
+     handle: ClosedRuntimeHandle,
+     allocated_addr: u64,
+     allocated_size: u64,
++    memory_kind: ClosedRuntimeLocalMemoryKind,
+ ) -> Result<(), ClosedSdkConsumerError> {
+     match transfer_engine_call(
+         handle,
+         ClosedRuntimeTransferEngineCall::UnregisterLocalSegment {
+             allocated_addr,
+             allocated_size,
++            memory_kind,
+         },
+     )
+     .await?
+@@ -1912,6 +1916,7 @@ pub async fn transfer_engine_transfer_data_no_copy(
+     target_addr: u64,
+     len: u64,
+     initial_local_segment_guard_handle: Option<u64>,
++    require_fast_path: bool,
+ ) -> Result<fluxon_commu_contract::TransferBreakdown, ClosedSdkConsumerError> {
+     match transfer_engine_call(
+         handle,
+@@ -1922,6 +1927,7 @@ pub async fn transfer_engine_transfer_data_no_copy(
+             target_addr,
+             len,
+             initial_local_segment_guard_handle,
++            require_fast_path,
+         },
+     )
+     .await?
+diff --git a/fluxon_rs/fluxon_commu_contract/src/closed_runtime.rs b/fluxon_rs/fluxon_commu_contract/src/closed_runtime.rs
+index 80872e2..17241cf 100644
+--- a/fluxon_rs/fluxon_commu_contract/src/closed_runtime.rs
++++ b/fluxon_rs/fluxon_commu_contract/src/closed_runtime.rs
+@@ -744,6 +744,15 @@ pub struct ClosedRuntimeDesiredTransferPeer {
+     pub enable_transfer_segment: bool,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
++pub enum ClosedRuntimeLocalMemoryKind {
++    Host,
++    Gpu { device_id: u32 },
++}
++
++pub const CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER: &str =
++    "fluxon_direct_fast_path_not_ready";
++
+ #[derive(Debug, Clone, Encode, Decode)]
+ pub enum ClosedRuntimeTransferEngineCall {
+     Init2ForInitDag {
+@@ -764,10 +773,12 @@ pub enum ClosedRuntimeTransferEngineCall {
+     RegisterLocalSegment {
+         allocated_addr: u64,
+         allocated_size: u64,
++        memory_kind: ClosedRuntimeLocalMemoryKind,
+     },
+     UnregisterLocalSegment {
+         allocated_addr: u64,
+         allocated_size: u64,
++        memory_kind: ClosedRuntimeLocalMemoryKind,
+     },
+     TransferDataNoCopy {
+         peer_node: Option<String>,
+@@ -776,6 +787,7 @@ pub enum ClosedRuntimeTransferEngineCall {
+         target_addr: u64,
+         len: u64,
+         initial_local_segment_guard_handle: Option<u64>,
++        require_fast_path: bool,
+     },
+     TrySendWireDirect {
+         peer_gen: ClosedRuntimePeerGen,
+diff --git a/fluxon_rs/fluxon_kv/framework_init_steps.yaml b/fluxon_rs/fluxon_kv/framework_init_steps.yaml
+index 923ae30..24ca312 100644
+--- a/fluxon_rs/fluxon_kv/framework_init_steps.yaml
++++ b/fluxon_rs/fluxon_kv/framework_init_steps.yaml
+@@ -62,8 +62,8 @@ module_tags:
+   MasterKvRouter: [master]
+   MetricReporter: [master, owner, external]
+   ClientKvApi: [owner]
+-  ClientSegPool: [owner]
+-  ClientTransferEngine: [master, owner]
++  ClientSegPool: [owner, external]
++  ClientTransferEngine: [master, owner, external]
+   ExternalClientApi: [external]
+   MasterLeaseManager: [master]
+ 
+diff --git a/fluxon_rs/fluxon_kv/src/client_kv_api/get.rs b/fluxon_rs/fluxon_kv/src/client_kv_api/get.rs
+index ddc5803..9e1c6a9 100644
+--- a/fluxon_rs/fluxon_kv/src/client_kv_api/get.rs
++++ b/fluxon_rs/fluxon_kv/src/client_kv_api/get.rs
+@@ -1424,6 +1424,7 @@ impl ClientKvApiInner {
+             serialize_part: GetStartReq {
+                 key: key.to_string(),
+                 prepared_target: None,
++                external_sink_target: None,
+             },
+             raw_bytes: Vec::new(),
+         };
+@@ -1464,6 +1465,7 @@ impl ClientKvApiInner {
+             serialize_part: BatchGetStartReq {
+                 keys,
+                 prepared_targets,
++                external_sink_targets: Vec::new(),
+             },
+             raw_bytes: Vec::new(),
+         };
+diff --git a/fluxon_rs/fluxon_kv/src/client_seg_pool/mod.rs b/fluxon_rs/fluxon_kv/src/client_seg_pool/mod.rs
+index 8c7cc78..8dd61aa 100644
+--- a/fluxon_rs/fluxon_kv/src/client_seg_pool/mod.rs
++++ b/fluxon_rs/fluxon_kv/src/client_seg_pool/mod.rs
+@@ -1,7 +1,7 @@
+ use crate::ClientKvApiAccessTrait;
+ use crate::client_kv_api::ClientKvApi;
+ use crate::client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait};
+-use crate::cluster_manager::ClusterManagerAccessTrait;
++use crate::cluster_manager::{ClusterManagerAccessTrait, NodeRole};
+ use crate::config::ContributeToClusterPoolSize;
+ use crate::master_seg_manager::msg_pack::SegmentDeviceMemInfo;
+ use crate::p2p::p2p_module::P2pModule;
+@@ -968,15 +968,24 @@ impl LogicalModule for ClientSegPool {
+ 
+     async fn shutdown(&self) -> Result<(), Self::Error> {
+         let _ = self.remove_side_transfer_peer().await;
+-        loop {
+-            if self.inner().view().client_kv_api().can_be_dropped() {
+-                tracing::info!("ClientSegPool can be dropped");
+-                break;
++        if !matches!(
++            self.inner()
++                .view()
++                .cluster_manager()
++                .get_self_info()
++                .node_role(),
++            NodeRole::External
++        ) {
++            loop {
++                if self.inner().view().client_kv_api().can_be_dropped() {
++                    tracing::info!("ClientSegPool can be dropped");
++                    break;
++                }
++                tracing::info!(
++                    "ClientSegPool waiting ClientKvApi can not be dropped , will try again after 3s (some user memholder may still be in use)"
++                );
++                tokio::time::sleep(Duration::from_secs(3)).await;
+             }
+-            tracing::info!(
+-                "ClientSegPool waiting ClientKvApi can not be dropped , will try again after 3s (some user memholder may still be in use)"
+-            );
+-            tokio::time::sleep(Duration::from_secs(3)).await;
+         }
+ 
+         if self.0.cpu_allocated_mem.read().await.is_some() {
+@@ -989,6 +998,15 @@ impl LogicalModule for ClientSegPool {
+ impl ClientSegPool {
+     pub async fn init2_for_init_dag(&self) -> KvResult<()> {
+         let inner = &self.0;
++        if matches!(
++            inner.view().cluster_manager().get_self_info().node_role(),
++            NodeRole::External
++        ) {
++            // External clients contribute no cache segment. They construct this
++            // module only to provide lifetime guards for an explicitly
++            // registered GPU staging range.
++            return Ok(());
++        }
+ 
+         // English note:
+         // - Invariant: register inbound RPC handlers before any awaited etcd operations that
+diff --git a/fluxon_rs/fluxon_kv/src/client_transfer_engine/mod.rs b/fluxon_rs/fluxon_kv/src/client_transfer_engine/mod.rs
+index 75f82f5..829b57e 100644
+--- a/fluxon_rs/fluxon_kv/src/client_transfer_engine/mod.rs
++++ b/fluxon_rs/fluxon_kv/src/client_transfer_engine/mod.rs
+@@ -21,7 +21,10 @@ use crate::{P2pModuleAccessTrait, cluster_manager::ClusterManagerAccessTrait};
+ use async_trait::async_trait;
+ use fluxon_commu::ClosedRuntimeHandle;
+ use fluxon_commu::p2p::PeerGen;
+-use fluxon_commu::transfer_engine::AttachedTransferEngine;
++use fluxon_commu::transfer_engine::{
++    AttachedTransferEngine, CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER,
++    ClosedRuntimeLocalMemoryKind,
++};
+ use fluxon_commu::{
+     ClientTransferEngineClusterRuntime, ClientTransferEngineCore, ClientTransferEngineRuntime,
+     CpuAllocatedMem, TransferBreakdown,
+@@ -29,7 +32,9 @@ use fluxon_commu::{
+ use fluxon_framework::{LogicalModule, define_module};
+ use std::future::Future;
+ use std::pin::Pin;
+-use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, OnceLock};
++use std::time::{Duration, Instant};
+ 
+ pub use fluxon_commu::{ClientTransferEngineNewArg, ClientTransferEngineRuntimeConfig};
+ 
+@@ -43,15 +48,228 @@ define_module!(
+     (client_seg_pool, ClientSegPool)
+ );
+ 
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct GpuMemoryRegistration {
++    pub registration_id: u64,
++    pub addr: u64,
++    pub len: u64,
++    pub device_id: u32,
++}
++
++impl GpuMemoryRegistration {
++    fn contains(&self, addr: u64, len: u64) -> bool {
++        if len == 0 {
++            return addr >= self.addr
++                && self
++                    .addr
++                    .checked_add(self.len)
++                    .is_some_and(|end| addr <= end);
++        }
++        let Some(end) = addr.checked_add(len) else {
++            return false;
++        };
++        let Some(registration_end) = self.addr.checked_add(self.len) else {
++            return false;
++        };
++        addr >= self.addr && end <= registration_end
++    }
++}
++
++#[derive(Clone, Debug)]
++pub struct GpuMemoryGuard {
++    registration: Arc<GpuMemoryRegistration>,
++}
++
++impl GpuMemoryGuard {
++    pub fn registration(&self) -> &GpuMemoryRegistration {
++        self.registration.as_ref()
++    }
++
++    fn contains(&self, addr: u64, len: u64) -> bool {
++        self.registration.contains(addr, len)
++    }
++}
++
++pub enum ClientTransferMemoryGuard {
++    Cpu(ClientCpuMemReadGuard),
++    Gpu(GpuMemoryGuard),
++}
++
++#[derive(Debug)]
++enum GpuMemoryRegistryState {
++    Empty,
++    Registering(GpuMemoryRegistration),
++    Active(Arc<GpuMemoryRegistration>),
++    Unregistering(GpuMemoryRegistration),
++}
++
++#[derive(Debug)]
++struct GpuMemoryRegistry {
++    next_registration_id: AtomicU64,
++    state: Mutex<GpuMemoryRegistryState>,
++}
++
++impl GpuMemoryRegistry {
++    fn new() -> Self {
++        Self {
++            next_registration_id: AtomicU64::new(1),
++            state: Mutex::new(GpuMemoryRegistryState::Empty),
++        }
++    }
++
++    fn begin_register(
++        &self,
++        addr: u64,
++        len: u64,
++        device_id: u32,
++    ) -> Result<GpuMemoryRegistration, String> {
++        if addr == 0 {
++            return Err("GPU registration address must be non-zero".to_string());
++        }
++        if len == 0 {
++            return Err("GPU registration length must be non-zero".to_string());
++        }
++        if addr.checked_add(len).is_none() {
++            return Err(format!(
++                "GPU registration range overflows: addr={:#x} len={}",
++                addr, len
++            ));
++        }
++        let registration_id = self.next_registration_id.fetch_add(1, Ordering::Relaxed);
++        let registration = GpuMemoryRegistration {
++            registration_id,
++            addr,
++            len,
++            device_id,
++        };
++        let mut state = self.state.lock().expect("gpu memory registry poisoned");
++        match &*state {
++            GpuMemoryRegistryState::Empty => {
++                *state = GpuMemoryRegistryState::Registering(registration.clone());
++                Ok(registration)
++            }
++            current => Err(format!(
++                "one GPU registration is already active or changing: {current:?}"
++            )),
++        }
++    }
++
++    fn finish_register(&self, registration_id: u64, success: bool) {
++        let mut state = self.state.lock().expect("gpu memory registry poisoned");
++        let previous = std::mem::replace(&mut *state, GpuMemoryRegistryState::Empty);
++        match previous {
++            GpuMemoryRegistryState::Registering(registration)
++                if registration.registration_id == registration_id =>
++            {
++                if success {
++                    *state = GpuMemoryRegistryState::Active(Arc::new(registration));
++                }
++            }
++            other => panic!(
++                "GPU registration completion does not match registry state: id={} state={other:?}",
++                registration_id
++            ),
++        }
++    }
++
++    fn begin_unregister(&self, registration_id: u64) -> Result<GpuMemoryRegistration, String> {
++        let mut state = self.state.lock().expect("gpu memory registry poisoned");
++        let previous = std::mem::replace(&mut *state, GpuMemoryRegistryState::Empty);
++        match previous {
++            GpuMemoryRegistryState::Active(registration) => {
++                if registration.registration_id != registration_id {
++                    let actual = registration.registration_id;
++                    *state = GpuMemoryRegistryState::Active(registration);
++                    return Err(format!(
++                        "GPU registration id mismatch: expected={} got={}",
++                        actual, registration_id
++                    ));
++                }
++                let guard_count = Arc::strong_count(&registration).saturating_sub(1);
++                if guard_count != 0 {
++                    *state = GpuMemoryRegistryState::Active(registration);
++                    return Err(format!(
++                        "GPU registration is busy: registration_id={} active_guards={}",
++                        registration_id, guard_count
++                    ));
++                }
++                let descriptor = registration.as_ref().clone();
++                *state = GpuMemoryRegistryState::Unregistering(descriptor.clone());
++                Ok(descriptor)
++            }
++            other => {
++                *state = other;
++                Err(format!(
++                    "GPU registration is not active: registration_id={}",
++                    registration_id
++                ))
++            }
++        }
++    }
++
++    fn finish_unregister(&self, registration_id: u64, success: bool) {
++        let mut state = self.state.lock().expect("gpu memory registry poisoned");
++        let previous = std::mem::replace(&mut *state, GpuMemoryRegistryState::Empty);
++        match previous {
++            GpuMemoryRegistryState::Unregistering(registration)
++                if registration.registration_id == registration_id =>
++            {
++                if !success {
++                    *state = GpuMemoryRegistryState::Active(Arc::new(registration));
++                }
++            }
++            other => panic!(
++                "GPU unregistration completion does not match registry state: id={} state={other:?}",
++                registration_id
++            ),
++        }
++    }
++
++    fn guard_for_range(&self, addr: u64, len: u64) -> Option<GpuMemoryGuard> {
++        let state = self.state.lock().expect("gpu memory registry poisoned");
++        match &*state {
++            GpuMemoryRegistryState::Active(registration) if registration.contains(addr, len) => {
++                Some(GpuMemoryGuard {
++                    registration: registration.clone(),
++                })
++            }
++            _ => None,
++        }
++    }
++
++    fn validate_destination(
++        &self,
++        registration_id: u64,
++        addr: u64,
++        capacity: u64,
++    ) -> Result<GpuMemoryGuard, String> {
++        let guard = self.guard_for_range(addr, capacity).ok_or_else(|| {
++            format!(
++                "GPU destination is outside the active registration: registration_id={} addr={:#x} capacity={}",
++                registration_id, addr, capacity
++            )
++        })?;
++        if guard.registration().registration_id != registration_id {
++            return Err(format!(
++                "GPU destination registration id mismatch: expected={} got={}",
++                guard.registration().registration_id,
++                registration_id
++            ));
++        }
++        Ok(guard)
++    }
++}
++
+ #[derive(Clone)]
+ struct ClientTransferRuntimeAdapter {
+     view: ClientTransferEngineView,
++    gpu_memory_registry: Arc<GpuMemoryRegistry>,
+ }
+ 
+ impl ClientTransferRuntimeAdapter {
+     fn local_segment_transfer_enabled(&self) -> bool {
+         let self_info = self.view.cluster_manager().get_self_info();
+-        matches!(self_info.node_role(), NodeRole::Client)
++        matches!(self_info.node_role(), NodeRole::Client | NodeRole::External)
+             || self_info
+                 .metadata
+                 .get("side_transfer_worker")
+@@ -156,7 +374,7 @@ impl ClientTransferEngineClusterRuntime for ClientTransferRuntimeAdapter {
+ 
+ #[async_trait]
+ impl ClientTransferEngineRuntime for ClientTransferRuntimeAdapter {
+-    type LocalSegmentGuard = ClientCpuMemReadGuard;
++    type LocalSegmentGuard = ClientTransferMemoryGuard;
+ 
+     fn supports_local_segment_transfer(&self) -> bool {
+         self.local_segment_transfer_enabled()
+@@ -181,12 +399,40 @@ impl ClientTransferEngineRuntime for ClientTransferRuntimeAdapter {
+     async fn ensure_local_segment_guard(
+         &self,
+         local_addr: u64,
+-        seg_guard: Option<ClientCpuMemReadGuard>,
+-    ) -> Result<ClientCpuMemReadGuard, String> {
++        seg_guard: Option<ClientTransferMemoryGuard>,
++    ) -> Result<ClientTransferMemoryGuard, String> {
+         if !self.local_segment_transfer_enabled() {
+             return Err("local segment transfer is not supported on this node role".to_string());
+         }
+-        p2p_transfer_rpc::ensure_local_segment_guard(&self.view, local_addr, seg_guard).await
++        if let Some(guard) = seg_guard {
++            return match guard {
++                ClientTransferMemoryGuard::Cpu(cpu_guard) => {
++                    p2p_transfer_rpc::ensure_local_segment_guard(
++                        &self.view,
++                        local_addr,
++                        Some(cpu_guard),
++                    )
++                    .await
++                    .map(ClientTransferMemoryGuard::Cpu)
++                }
++                ClientTransferMemoryGuard::Gpu(gpu_guard) => {
++                    if gpu_guard.contains(local_addr, 1) {
++                        Ok(ClientTransferMemoryGuard::Gpu(gpu_guard))
++                    } else {
++                        Err(format!(
++                            "GPU guard does not cover local address: addr={:#x}",
++                            local_addr
++                        ))
++                    }
++                }
++            };
++        }
++        if let Some(gpu_guard) = self.gpu_memory_registry.guard_for_range(local_addr, 1) {
++            return Ok(ClientTransferMemoryGuard::Gpu(gpu_guard));
++        }
++        p2p_transfer_rpc::ensure_local_segment_guard(&self.view, local_addr, None)
++            .await
++            .map(ClientTransferMemoryGuard::Cpu)
+     }
+ 
+     fn register_p2p_transfer_rpc(&self) {
+@@ -231,20 +477,27 @@ impl ClientTransferEngineRuntime for ClientTransferRuntimeAdapter {
+         remote_src: u64,
+         local_target: u64,
+         len: u64,
+-        seg_guard: ClientCpuMemReadGuard,
++        seg_guard: ClientTransferMemoryGuard,
+     ) -> Result<(), String> {
+         if !self.local_segment_transfer_enabled() {
+             return Err("p2p raw-memory read is not supported on this node role".to_string());
+         }
+-        p2p_transfer_rpc::p2p_read_to_local(
+-            &self.view,
+-            peer,
+-            remote_src,
+-            local_target,
+-            len,
+-            seg_guard,
+-        )
+-        .await
++        match seg_guard {
++            ClientTransferMemoryGuard::Cpu(cpu_guard) => {
++                p2p_transfer_rpc::p2p_read_to_local(
++                    &self.view,
++                    peer,
++                    remote_src,
++                    local_target,
++                    len,
++                    cpu_guard,
++                )
++                .await
++            }
++            ClientTransferMemoryGuard::Gpu(_) => Err(
++                "GPU destination requires the RDMA fast path; P2P fallback is disabled".to_string(),
++            ),
++        }
+     }
+ 
+     async fn p2p_write_from_local(
+@@ -254,21 +507,28 @@ impl ClientTransferEngineRuntime for ClientTransferRuntimeAdapter {
+         remote_target: u64,
+         len: u64,
+         copy_from: Option<Pin<&[u8]>>,
+-        seg_guard: ClientCpuMemReadGuard,
++        seg_guard: ClientTransferMemoryGuard,
+     ) -> Result<(), String> {
+         if !self.local_segment_transfer_enabled() {
+             return Err("p2p raw-memory write is not supported on this node role".to_string());
+         }
+-        p2p_transfer_rpc::p2p_write_from_local(
+-            &self.view,
+-            peer,
+-            local_src,
+-            remote_target,
+-            len,
+-            copy_from,
+-            seg_guard,
+-        )
+-        .await
++        match seg_guard {
++            ClientTransferMemoryGuard::Cpu(cpu_guard) => {
++                p2p_transfer_rpc::p2p_write_from_local(
++                    &self.view,
++                    peer,
++                    local_src,
++                    remote_target,
++                    len,
++                    copy_from,
++                    cpu_guard,
++                )
++                .await
++            }
++            ClientTransferMemoryGuard::Gpu(_) => {
++                Err("GPU source requires the RDMA fast path; P2P fallback is disabled".to_string())
++            }
++        }
+     }
+ 
+     fn try_record_local_ipc_bytes_for_owner_topology(
+@@ -308,12 +568,14 @@ impl ClientTransferEngineRuntime for ClientTransferRuntimeAdapter {
+ pub struct ClientTransferEngine {
+     view: OnceLock<ClientTransferEngineView>,
+     core: ClientTransferEngineCore,
++    gpu_memory_registry: Arc<GpuMemoryRegistry>,
+ }
+ 
+ impl ClientTransferEngine {
+     fn runtime(&self) -> ClientTransferRuntimeAdapter {
+         ClientTransferRuntimeAdapter {
+             view: self.view.get().unwrap().clone(),
++            gpu_memory_registry: self.gpu_memory_registry.clone(),
+         }
+     }
+ 
+@@ -333,6 +595,7 @@ impl ClientTransferEngine {
+         Ok(Self {
+             view: OnceLock::new(),
+             core,
++            gpu_memory_registry: Arc::new(GpuMemoryRegistry::new()),
+         })
+     }
+ 
+@@ -369,6 +632,81 @@ impl ClientTransferEngine {
+             .map_err(KvError::from)
+     }
+ 
++    pub async fn register_gpu_memory(
++        &self,
++        addr: u64,
++        len: u64,
++        device_id: u32,
++    ) -> KvResult<GpuMemoryRegistration> {
++        let registration = self
++            .gpu_memory_registry
++            .begin_register(addr, len, device_id)
++            .map_err(|detail| {
++                KvError::Api(
++                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
++                        detail,
++                    },
++                )
++            })?;
++        let result = self
++            .core
++            .register_local_memory(
++                self.runtime(),
++                addr,
++                len,
++                ClosedRuntimeLocalMemoryKind::Gpu { device_id },
++            )
++            .await
++            .map_err(KvError::from);
++        self.gpu_memory_registry
++            .finish_register(registration.registration_id, result.is_ok());
++        result.map(|()| registration)
++    }
++
++    pub async fn unregister_gpu_memory(&self, registration_id: u64) -> KvResult<()> {
++        let registration = self
++            .gpu_memory_registry
++            .begin_unregister(registration_id)
++            .map_err(|detail| {
++                KvError::Api(
++                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
++                        detail,
++                    },
++                )
++            })?;
++        let result = self
++            .core
++            .unregister_local_memory(
++                registration.addr,
++                registration.len,
++                ClosedRuntimeLocalMemoryKind::Gpu {
++                    device_id: registration.device_id,
++                },
++            )
++            .await
++            .map_err(KvError::from);
++        self.gpu_memory_registry
++            .finish_unregister(registration_id, result.is_ok());
++        result
++    }
++
++    pub fn validate_gpu_destination(
++        &self,
++        registration_id: u64,
++        addr: u64,
++        capacity: u64,
++    ) -> KvResult<GpuMemoryGuard> {
++        self.gpu_memory_registry
++            .validate_destination(registration_id, addr, capacity)
++            .map_err(|detail| {
++                KvError::Api(
++                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
++                        detail,
++                    },
++                )
++            })
++    }
++
+     pub async fn write_data(
+         &self,
+         data: Pin<&[u8]>,
+@@ -386,7 +724,7 @@ impl ClientTransferEngine {
+                 target_addr,
+                 peer_id,
+                 do_copy,
+-                seg_guard,
++                seg_guard.map(ClientTransferMemoryGuard::Cpu),
+             )
+             .await
+             .map_err(KvError::from)
+@@ -409,11 +747,87 @@ impl ClientTransferEngine {
+                 src_addr,
+                 target_addr,
+                 len,
+-                seg_guard,
++                seg_guard.map(ClientTransferMemoryGuard::Cpu),
++                false,
+             )
+             .await
+             .map_err(KvError::from)
+     }
++
++    /// Pull remote bytes into an explicitly validated caller-owned GPU range.
++    ///
++    /// Keeping this separate from the CPU entry point prevents a CUDA virtual
++    /// address from silently falling through CPU/P2P guard discovery.  The
++    /// guard is moved into the transfer engine and retains the exact
++    /// registration generation until the backend releases the local segment
++    /// lease.
++    pub async fn transfer_data_no_copy_to_gpu(
++        &self,
++        peer_node: NodeIDString,
++        src_addr: u64,
++        target_addr: u64,
++        len: u64,
++        gpu_guard: GpuMemoryGuard,
++    ) -> KvResult<TransferBreakdown> {
++        if len == 0 {
++            return Err(KvError::Api(
++                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
++                    detail: "GPU transfer length must be non-zero".to_string(),
++                },
++            ));
++        }
++        if !gpu_guard.contains(target_addr, len) {
++            return Err(KvError::Api(
++                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
++                    detail: format!(
++                        "GPU transfer exceeds destination guard: target={:#x} len={} registration_id={}",
++                        target_addr,
++                        len,
++                        gpu_guard.registration().registration_id
++                    ),
++                },
++            ));
++        }
++        const DIRECT_READY_TIMEOUT: Duration = Duration::from_secs(5);
++        const DIRECT_RETRY_DELAY: Duration = Duration::from_millis(10);
++
++        let started = Instant::now();
++        let mut attempt = 0_u32;
++        loop {
++            attempt = attempt.saturating_add(1);
++            let result = self
++                .core
++                .transfer_data_no_copy(
++                    self.runtime(),
++                    Some(peer_node.clone()),
++                    true,
++                    src_addr,
++                    target_addr,
++                    len,
++                    Some(ClientTransferMemoryGuard::Gpu(gpu_guard.clone())),
++                    true,
++                )
++                .await;
++            match result {
++                Ok(breakdown) => return Ok(breakdown),
++                Err(err)
++                    if err
++                        .to_string()
++                        .contains(CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER)
++                        && started.elapsed() < DIRECT_READY_TIMEOUT =>
++                {
++                    tracing::debug!(
++                        peer = %peer_node,
++                        attempt,
++                        elapsed_ms = started.elapsed().as_millis(),
++                        "GPU direct transfer is waiting for the RDMA peer fast path"
++                    );
++                    limit_thirdparty::tokio::time::sleep(DIRECT_RETRY_DELAY).await;
++                }
++                Err(err) => return Err(KvError::from(err)),
++            }
++        }
++    }
+ }
+ 
+ #[async_trait]
+@@ -435,3 +849,101 @@ impl LogicalModule for ClientTransferEngine {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod gpu_memory_registry_tests {
++    use super::GpuMemoryRegistry;
++
++    fn active_registry() -> (GpuMemoryRegistry, u64) {
++        let registry = GpuMemoryRegistry::new();
++        let registration = registry
++            .begin_register(0x1000, 0x1000, 2)
++            .expect("registration must start");
++        let registration_id = registration.registration_id;
++        registry.finish_register(registration_id, true);
++        (registry, registration_id)
++    }
++
++    #[test]
++    fn validates_exact_registration_generation_and_range() {
++        let (registry, registration_id) = active_registry();
++
++        let guard = registry
++            .validate_destination(registration_id, 0x1400, 0x400)
++            .expect("subrange must validate");
++        assert_eq!(guard.registration().registration_id, registration_id);
++        assert_eq!(guard.registration().device_id, 2);
++
++        assert!(
++            registry
++                .validate_destination(registration_id + 1, 0x1400, 0x400)
++                .unwrap_err()
++                .contains("registration id mismatch")
++        );
++        assert!(
++            registry
++                .validate_destination(registration_id, 0x1f00, 0x200)
++                .unwrap_err()
++                .contains("outside the active registration")
++        );
++    }
++
++    #[test]
++    fn rejects_invalid_registration_geometry() {
++        let registry = GpuMemoryRegistry::new();
++        assert!(registry.begin_register(0, 1, 0).is_err());
++        assert!(registry.begin_register(1, 0, 0).is_err());
++        assert!(registry.begin_register(u64::MAX, 2, 0).is_err());
++    }
++
++    #[test]
++    fn unregister_waits_for_destination_guards() {
++        let (registry, registration_id) = active_registry();
++        let guard = registry
++            .validate_destination(registration_id, 0x1000, 0x1000)
++            .expect("full range must validate");
++
++        assert!(
++            registry
++                .begin_unregister(registration_id)
++                .unwrap_err()
++                .contains("GPU registration is busy")
++        );
++        drop(guard);
++
++        let descriptor = registry
++            .begin_unregister(registration_id)
++            .expect("unregister must start after guards drop");
++        assert_eq!(descriptor.registration_id, registration_id);
++        registry.finish_unregister(registration_id, true);
++        assert!(
++            registry
++                .validate_destination(registration_id, 0x1000, 1)
++                .is_err()
++        );
++    }
++
++    #[test]
++    fn failed_backend_transitions_restore_retryable_state() {
++        let registry = GpuMemoryRegistry::new();
++        let first = registry
++            .begin_register(0x1000, 0x1000, 0)
++            .expect("first registration must start");
++        registry.finish_register(first.registration_id, false);
++
++        let second = registry
++            .begin_register(0x3000, 0x1000, 1)
++            .expect("failed registration must return to empty");
++        registry.finish_register(second.registration_id, true);
++        let descriptor = registry
++            .begin_unregister(second.registration_id)
++            .expect("unregister must start");
++        registry.finish_unregister(descriptor.registration_id, false);
++
++        assert!(
++            registry
++                .validate_destination(second.registration_id, 0x3000, 1)
++                .is_ok()
++        );
++    }
++}
+diff --git a/fluxon_rs/fluxon_kv/src/external_client_api/mod.rs b/fluxon_rs/fluxon_kv/src/external_client_api/mod.rs
+index 2008f1b..86851bf 100644
+--- a/fluxon_rs/fluxon_kv/src/external_client_api/mod.rs
++++ b/fluxon_rs/fluxon_kv/src/external_client_api/mod.rs
+@@ -1,3 +1,4 @@
++use crate::ClientTransferEngineAccessTrait;
+ use crate::SharedJsonMeta;
+ use crate::client_kv_api::external_api::{
+     compute_external_get_start_transfer_prefix, normalize_external_get_start_group_lens,
+@@ -8,9 +9,16 @@ use crate::client_kv_api::msg_pack::{
+     ExternalInvalidateWeakIndexResp,
+ };
+ use crate::client_seg_pool::{ClientSegPool, SideTransferPeerFileMeta};
++use crate::client_transfer_engine::{ClientTransferEngine, GpuMemoryGuard};
++use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+ use crate::cluster_manager::{
+     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
+ };
++use crate::master_kv_router::msg_pack::{
++    BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeReq, BatchGetRevokeResp,
++    BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp, GetAllocationMode,
++    GetExternalSinkTarget,
++};
+ use crate::rpcresp_kvresult_convert::ToResult;
+ use crate::{
+     client_kv_api::msg_pack::{
+@@ -37,6 +45,7 @@ use crate::{
+     },
+     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK, SharedMemError},
+ };
++use ::tokio::sync::watch;
+ use async_trait::async_trait;
+ use core::panic;
+ use dashmap::DashMap;
+@@ -44,6 +53,7 @@ use fluxon_commu::ShareGroupOwnerRef;
+ use fluxon_framework::{LogicalModule, define_module};
+ use fluxon_observability::kv_metrics_actor::{ObserveComponent, ObserveDirection};
+ use fluxon_util::semaphore_map::SemaphoreMap;
++use futures::{StreamExt, stream};
+ use libc::{MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
+ use limit_thirdparty::tokio;
+ use limit_thirdparty::tokio::sync::{ARwLock, Notify};
+@@ -54,7 +64,7 @@ use std::{
+     // path::PathBuf, // 不再使用PathBuf
+     sync::{
+         Arc, OnceLock, Weak,
+-        atomic::{AtomicUsize, Ordering},
++        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+     },
+     time::{Duration, Instant},
+ };
+@@ -79,6 +89,7 @@ const EXTERNAL_PUT_START_RPC_TIMEOUT_SECS: u64 = 30;
+ const EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS: u64 = 30;
+ const EXTERNAL_RPC_P2P_RECOVER_MAX_ATTEMPTS: usize = 3;
+ const EXTERNAL_PUT_TRACE_LOG_WINDOW_SECS: u64 = 10;
++const EXTERNAL_OWNER_INTRA_RPC_READY_TIMEOUT_SECS: u64 = 30;
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub(crate) enum ExternalDeleteAckBatchSendResult {
+@@ -92,6 +103,52 @@ pub struct ExternalClientGetStartResp {
+     pub raw_prefix_hit_len: usize,
+ }
+ 
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ExternalGpuDestination {
++    pub registration_id: u64,
++    pub addr: u64,
++    pub capacity: u64,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ExternalGpuGetStartResp {
++    pub handle: u64,
++    pub raw_prefix_hit_len: usize,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ExternalGpuGetTransferResp {
++    pub transferred_prefix_len: usize,
++    pub consumed_prefix_len: usize,
++}
++
++fn external_gpu_transfer_plan_geometry_is_valid(
++    item: &BatchGetStartItemResp,
++    destination: &ExternalGpuDestination,
++    registered_generation: u64,
++) -> bool {
++    item.len != 0
++        && item.target_addr == destination.addr
++        && item.target_base_addr == destination.addr
++        && item.len <= destination.capacity
++        && item.prepared_target.is_none()
++        && registered_generation == destination.registration_id
++}
++
++#[derive(Clone, Debug)]
++enum ExternalGpuGetTerminal {
++    Completed,
++    Revoked { transfer_error: Option<String> },
++    Failed { detail: String },
++}
++
++struct PendingExternalGpuGet {
++    transferable_len: usize,
++    atomic_group_lens: Vec<usize>,
++    cancel_requested: Arc<AtomicBool>,
++    terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminal>>,
++}
++
+ struct PendingExternalGetStart {
+     keys: Vec<String>,
+     transferable_len: usize,
+@@ -182,10 +239,12 @@ fn inline_external_get_tail_holder_ids(
+ #[cfg(test)]
+ mod inline_external_get_start_tests {
+     use super::{
++        ExternalGpuDestination, external_gpu_transfer_plan_geometry_is_valid,
+         inline_external_get_tail_holder_ids, validate_inline_external_get_owner_generation,
+         validate_inline_external_get_start_plan,
+     };
+     use crate::client_kv_api::msg_pack::ExternalBatchGetItemResp;
++    use crate::master_kv_router::msg_pack::BatchGetStartItemResp;
+     use crate::memholder::ExternalMemHolderInfo;
+     use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
+ 
+@@ -241,6 +300,28 @@ mod inline_external_get_start_tests {
+         assert!(inline_external_get_tail_holder_ids(&items, 0).is_err());
+         assert!(inline_external_get_tail_holder_ids(&items, 4).is_err());
+     }
++
++    #[test]
++    fn gpu_transfer_plan_accepts_zero_as_the_first_master_get_id() {
++        let destination = ExternalGpuDestination {
++            registration_id: 7,
++            addr: 0x1000,
++            capacity: 4096,
++        };
++        let item = BatchGetStartItemResp {
++            get_id: 0,
++            target_addr: destination.addr,
++            target_base_addr: destination.addr,
++            len: destination.capacity,
++            ..Default::default()
++        };
++
++        assert!(external_gpu_transfer_plan_geometry_is_valid(
++            &item,
++            &destination,
++            destination.registration_id,
++        ));
++    }
+ }
+ 
+ fn duration_to_i64_us(duration: std::time::Duration) -> i64 {
+@@ -422,7 +503,8 @@ define_module!(
+     ExternalClientApi,
+     (external_client_api, ExternalClientApi),
+     (p2p, P2pModule),
+-    (cluster_manager, ClusterManager)
++    (cluster_manager, ClusterManager),
++    (client_transfer_engine, ClientTransferEngine)
+ );
+ 
+ /// External Client configuration parameters
+@@ -498,6 +580,9 @@ pub struct ExternalInner {
+     rpc_caller_external_batch_get_start: RPCCaller<ExternalBatchGetStartReq>,
+     rpc_caller_external_batch_get_transfer: RPCCaller<ExternalBatchGetTransferReq>,
+     rpc_caller_external_batch_get_cancel: RPCCaller<ExternalBatchGetCancelReq>,
++    rpc_caller_master_batch_get_start: RPCCaller<BatchGetStartReq>,
++    rpc_caller_master_batch_get_done: RPCCaller<BatchGetDoneReq>,
++    rpc_caller_master_batch_get_revoke: RPCCaller<BatchGetRevokeReq>,
+     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
+     rpc_caller_external_batch_put_commit: RPCCaller<ExternalBatchPutCommitReq>,
+     rpc_caller_external_put_start: RPCCaller<ExternalPutStartReq>,
+@@ -519,6 +604,8 @@ pub struct ExternalInner {
+     pending_external_get_start: DashMap<u64, PendingExternalGetStart>,
+     /// Fully local plans consumed without a follow-up owner transfer RPC.
+     pending_inline_external_get_start: DashMap<u64, PendingInlineExternalGetStart>,
++    next_gpu_get_handle: AtomicU64,
++    pending_external_gpu_get: DashMap<u64, PendingExternalGpuGet>,
+     /// per-key semaphore (permits=1) to ensure single inflight per key
+     inflight1_per_key: SemaphoreMap<String>,
+     put_trace_log_window: Mutex<ExternalPutTraceLogWindow>,
+@@ -527,6 +614,133 @@ pub struct ExternalInner {
+ 
+ pub struct ExternalClientApi(ExternalInner);
+ 
++async fn wait_external_gpu_get_terminal(
++    mut terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminal>>,
++) -> KvResult<ExternalGpuGetTerminal> {
++    loop {
++        if let Some(terminal) = terminal_rx.borrow().clone() {
++            return Ok(terminal);
++        }
++        if terminal_rx.changed().await.is_err() {
++            return Err(KvError::Api(ApiError::Unknown {
++                detail: "GPU Get transfer task ended without publishing a terminal state"
++                    .to_string(),
++            }));
++        }
++    }
++}
++
++async fn run_external_gpu_get_transfer(
++    view: ExternalClientApiView,
++    transfer_items: Vec<(BatchGetStartItemResp, GpuMemoryGuard)>,
++    skipped_get_ids: Vec<u64>,
++    transfer_concurrency: usize,
++    cancel_requested: Arc<AtomicBool>,
++) -> ExternalGpuGetTerminal {
++    let transfer_get_ids = transfer_items
++        .iter()
++        .map(|(item, _)| item.get_id)
++        .collect::<Vec<_>>();
++    let mut all_get_ids = skipped_get_ids.clone();
++    all_get_ids.extend(transfer_get_ids.iter().copied());
++
++    let skipped_revoke_error = view
++        .external_client_api()
++        .inner()
++        .master_batch_gpu_get_revoke(skipped_get_ids)
++        .await
++        .err()
++        .map(|err| err.to_string());
++
++    if transfer_items.is_empty() {
++        return match skipped_revoke_error {
++            Some(detail) => ExternalGpuGetTerminal::Failed {
++                detail: format!("GPU Get could not revoke non-transferable starts: {detail}"),
++            },
++            None => ExternalGpuGetTerminal::Revoked {
++                transfer_error: None,
++            },
++        };
++    }
++
++    let transfer_futures = transfer_items.into_iter().map(|(item, gpu_guard)| {
++        let transfer_view = view.clone();
++        let cancel_requested = cancel_requested.clone();
++        async move {
++            if cancel_requested.load(Ordering::Acquire) {
++                return None;
++            }
++            transfer_view
++                .client_transfer_engine()
++                .transfer_data_no_copy_to_gpu(
++                    item.node_id.clone(),
++                    item.src_addr,
++                    item.target_addr,
++                    item.len,
++                    gpu_guard,
++                )
++                .await
++                .err()
++                .map(|err| {
++                    format!(
++                        "GPU Get transfer failed: get_id={} source={} src={:#x} target={:#x} len={} error={}",
++                        item.get_id,
++                        item.node_id,
++                        item.src_addr,
++                        item.target_addr,
++                        item.len,
++                        err
++                    )
++                })
++        }
++    });
++    let mut transfer_stream =
++        stream::iter(transfer_futures).buffer_unordered(transfer_concurrency.max(1));
++    let mut transfer_error = None;
++    while let Some(item_error) = transfer_stream.next().await {
++        if transfer_error.is_none() {
++            transfer_error = item_error;
++        }
++    }
++
++    let cancelled = cancel_requested.load(Ordering::Acquire);
++    if cancelled || transfer_error.is_some() || skipped_revoke_error.is_some() {
++        if let Err(err) = view
++            .external_client_api()
++            .inner()
++            .master_batch_gpu_get_revoke(all_get_ids)
++            .await
++        {
++            return ExternalGpuGetTerminal::Failed {
++                detail: format!(
++                    "GPU Get cleanup failed after transfer/cancel: transfer_error={:?} skipped_revoke_error={:?} revoke_error={}",
++                    transfer_error, skipped_revoke_error, err
++                ),
++            };
++        }
++        if let Some(detail) = skipped_revoke_error {
++            return ExternalGpuGetTerminal::Failed {
++                detail: format!(
++                    "GPU Get initially failed to revoke non-transferable starts: {detail}"
++                ),
++            };
++        }
++        return ExternalGpuGetTerminal::Revoked { transfer_error };
++    }
++
++    match view
++        .external_client_api()
++        .inner()
++        .master_batch_gpu_get_done(transfer_get_ids)
++        .await
++    {
++        Ok(()) => ExternalGpuGetTerminal::Completed,
++        Err(err) => ExternalGpuGetTerminal::Failed {
++            detail: format!("GPU Get BatchDone failed: {err}"),
++        },
++    }
++}
++
+ impl ExternalClientApi {
+     /// Access inner external-only API. Safe to unwrap in external role.
+     pub fn inner(&self) -> &ExternalInner {
+@@ -567,6 +781,9 @@ impl ExternalClientApi {
+             rpc_caller_external_batch_get_start: RPCCaller::<ExternalBatchGetStartReq>::new(),
+             rpc_caller_external_batch_get_transfer: RPCCaller::<ExternalBatchGetTransferReq>::new(),
+             rpc_caller_external_batch_get_cancel: RPCCaller::<ExternalBatchGetCancelReq>::new(),
++            rpc_caller_master_batch_get_start: RPCCaller::<BatchGetStartReq>::new(),
++            rpc_caller_master_batch_get_done: RPCCaller::<BatchGetDoneReq>::new(),
++            rpc_caller_master_batch_get_revoke: RPCCaller::<BatchGetRevokeReq>::new(),
+             rpc_caller_external_put_commit: RPCCaller::<ExternalPutCommitReq>::new(),
+             rpc_caller_external_batch_put_commit: RPCCaller::<ExternalBatchPutCommitReq>::new(),
+             rpc_caller_external_put_start: RPCCaller::<ExternalPutStartReq>::new(),
+@@ -587,6 +804,8 @@ impl ExternalClientApi {
+             key_weak_memholder_index: DashMap::new(),
+             pending_external_get_start: DashMap::new(),
+             pending_inline_external_get_start: DashMap::new(),
++            next_gpu_get_handle: AtomicU64::new(1),
++            pending_external_gpu_get: DashMap::new(),
+             inflight1_per_key: SemaphoreMap::new(1, std::time::Duration::from_secs(120)),
+             put_trace_log_window: Mutex::new(ExternalPutTraceLogWindow::new()),
+             external_delete_ack_batch: ExternalDeleteAckBatchHandle::new(),
+@@ -666,6 +885,12 @@ impl ExternalClientApi {
+             .regist(ext.view.p2p_module());
+         ext.rpc_caller_external_batch_get_cancel
+             .regist(ext.view.p2p_module());
++        ext.rpc_caller_master_batch_get_start
++            .regist(ext.view.p2p_module());
++        ext.rpc_caller_master_batch_get_done
++            .regist(ext.view.p2p_module());
++        ext.rpc_caller_master_batch_get_revoke
++            .regist(ext.view.p2p_module());
+         ext.rpc_caller_external_put_commit
+             .regist(ext.view.p2p_module());
+         ext.rpc_caller_external_batch_put_commit
+@@ -740,6 +965,11 @@ impl ExternalClientApi {
+             .set_self_sub_cluster(ext.initial_sub_cluster.get().unwrap().clone())
+             .await
+             .map_err(KvError::from)?;
++        // Publishing the share-group binding changes the desired local-owner route from the
++        // pre-binding direct lane to intra-machine-only.  Do not announce external init complete
++        // until that topology transition has converged for the exact owner generation.
++        self.wait_current_owner_intra_rpc_ready_after_binding()
++            .await?;
+ 
+         {
+             let view = ext.view.clone_view();
+@@ -894,6 +1124,61 @@ impl ExternalClientApi {
+             }
+         }
+     }
++
++    async fn wait_current_owner_intra_rpc_ready_after_binding(&self) -> Result<(), KvError> {
++        let ext = &self.0;
++        let owner_id = ext
++            .shared_storage_node_id()
++            .await
++            .expect("external role expects current_owner to be Some after init2");
++        let owner_node_id = owner_id.clone().into();
++        let owner_start_time = ext.current_owner_start_time().await;
++        let expected_binding = ShareGroupOwnerRef {
++            owner_id: owner_id.clone(),
++            owner_start_time,
++        };
++        let started_at = Instant::now();
++        let timeout = Duration::from_secs(EXTERNAL_OWNER_INTRA_RPC_READY_TIMEOUT_SECS);
++
++        tracing::info!(
++            owner_id = %owner_id,
++            owner_start_time,
++            "External init: waiting for current owner intra-machine RPC route after share-group binding"
++        );
++        loop {
++            let snapshot = ext.view.p2p_module().tier_snapshot();
++            let self_binding_ready = snapshot
++                .share_group_owner(&snapshot.self_peer_gen.peer_id)
++                == Some(&expected_binding);
++            if self_binding_ready
++                && let Some(peer_gen) = snapshot.peer_gen(&owner_node_id)
++                && peer_gen.node_start_time == owner_start_time
++                && snapshot.is_send_ready_intra_effective(&peer_gen)
++            {
++                tracing::info!(
++                    owner_id = %owner_id,
++                    owner_start_time,
++                    elapsed_ms = started_at.elapsed().as_millis(),
++                    "External init: current owner intra-machine RPC route ready after share-group binding"
++                );
++                return Ok(());
++            }
++
++            if started_at.elapsed() >= timeout {
++                return Err(KvError::Api(ApiError::Unknown {
++                    detail: format!(
++                        "timed out waiting for current owner intra-machine RPC route after share-group binding: owner_id={} owner_start_time={} timeout_s={} self_binding={:?} peer={:?}",
++                        owner_id,
++                        owner_start_time,
++                        EXTERNAL_OWNER_INTRA_RPC_READY_TIMEOUT_SECS,
++                        snapshot.share_group_owner(&snapshot.self_peer_gen.peer_id),
++                        snapshot.peers.get(owner_id.as_str()),
++                    ),
++                }));
++            }
++            sleep(Duration::from_millis(20)).await;
++        }
++    }
+ }
+ 
+ impl ExternalInner {
+@@ -2044,6 +2329,404 @@ impl ExternalInner {
+         }
+     }
+ 
++    async fn master_batch_gpu_get_revoke(&self, get_ids: Vec<u64>) -> KvResult<()> {
++        if get_ids.is_empty() {
++            return Ok(());
++        }
++        let master_node_id = self
++            .view
++            .cluster_manager()
++            .find_or_wait_master_node()
++            .await?;
++        let expected_get_ids = get_ids.clone();
++        let resp: MsgPack<BatchGetRevokeResp> = self
++            .rpc_caller_master_batch_get_revoke
++            .call(
++                self.view.p2p_module(),
++                master_node_id.into(),
++                MsgPack {
++                    serialize_part: BatchGetRevokeReq { get_ids },
++                    raw_bytes: Vec::new(),
++                },
++                None,
++                0,
++            )
++            .await
++            .map_err(KvError::from)?;
++        crate::rpcresp_kvresult_convert::try_from_code(
++            resp.serialize_part.error_code,
++            resp.serialize_part.error_json.clone(),
++        )?;
++        if resp.serialize_part.items.len() != expected_get_ids.len() {
++            return Err(KvError::Api(ApiError::Unknown {
++                detail: format!(
++                    "GPU Get BatchRevoke response length mismatch: expected={} got={}",
++                    expected_get_ids.len(),
++                    resp.serialize_part.items.len()
++                ),
++            }));
++        }
++        for (expected_get_id, item) in expected_get_ids
++            .into_iter()
++            .zip(resp.serialize_part.items.into_iter())
++        {
++            if item.get_id != expected_get_id {
++                return Err(KvError::Api(ApiError::Unknown {
++                    detail: format!(
++                        "GPU Get BatchRevoke response identity mismatch: expected={} got={}",
++                        expected_get_id, item.get_id
++                    ),
++                }));
++            }
++            crate::rpcresp_kvresult_convert::try_from_code(item.error_code, item.error_json)?;
++        }
++        Ok(())
++    }
++
++    async fn master_batch_gpu_get_done(&self, get_ids: Vec<u64>) -> KvResult<()> {
++        if get_ids.is_empty() {
++            return Ok(());
++        }
++        let master_node_id = self
++            .view
++            .cluster_manager()
++            .find_or_wait_master_node()
++            .await?;
++        let expected_get_ids = get_ids.clone();
++        let resp: MsgPack<BatchGetDoneResp> = self
++            .rpc_caller_master_batch_get_done
++            .call(
++                self.view.p2p_module(),
++                master_node_id.into(),
++                MsgPack {
++                    serialize_part: BatchGetDoneReq { get_ids },
++                    raw_bytes: Vec::new(),
++                },
++                None,
++                0,
++            )
++            .await
++            .map_err(KvError::from)?;
++        crate::rpcresp_kvresult_convert::try_from_code(
++            resp.serialize_part.error_code,
++            resp.serialize_part.error_json.clone(),
++        )?;
++        if resp.serialize_part.items.len() != expected_get_ids.len() {
++            return Err(KvError::Api(ApiError::Unknown {
++                detail: format!(
++                    "GPU Get BatchDone response length mismatch: expected={} got={}",
++                    expected_get_ids.len(),
++                    resp.serialize_part.items.len()
++                ),
++            }));
++        }
++        for (expected_get_id, item) in expected_get_ids
++            .into_iter()
++            .zip(resp.serialize_part.items.into_iter())
++        {
++            if item.get_id != expected_get_id {
++                return Err(KvError::Api(ApiError::Unknown {
++                    detail: format!(
++                        "GPU Get BatchDone response identity mismatch: expected={} got={}",
++                        expected_get_id, item.get_id
++                    ),
++                }));
++            }
++            crate::rpcresp_kvresult_convert::try_from_code(item.error_code, item.error_json)?;
++            if item.holder_id != 0 || item.allocation_mode != GetAllocationMode::ExternalSink {
++                return Err(KvError::Api(ApiError::Unknown {
++                    detail: format!(
++                        "GPU Get BatchDone returned a cache-owned target: get_id={} holder_id={} allocation_mode={:?}",
++                        item.get_id, item.holder_id, item.allocation_mode
++                    ),
++                }));
++            }
++        }
++        Ok(())
++    }
++
++    pub async fn get_start_gpu(
++        &self,
++        keys: Vec<String>,
++        destinations: Vec<ExternalGpuDestination>,
++        prefix_best_effort: bool,
++        atomic_group_lens: Option<Vec<usize>>,
++        transfer_concurrency: usize,
++    ) -> KvResult<ExternalGpuGetStartResp> {
++        if keys.is_empty() {
++            return Err(KvError::Api(ApiError::InvalidArgument {
++                detail: "get_start_gpu requires at least one key".to_string(),
++            }));
++        }
++        if keys.len() != destinations.len() {
++            return Err(KvError::Api(ApiError::InvalidArgument {
++                detail: format!(
++                    "get_start_gpu keys/destinations length mismatch: keys={} destinations={}",
++                    keys.len(),
++                    destinations.len()
++                ),
++            }));
++        }
++        if transfer_concurrency == 0 {
++            return Err(KvError::Api(ApiError::InvalidArgument {
++                detail: "get_start_gpu transfer_concurrency must be > 0".to_string(),
++            }));
++        }
++        let group_lens = normalize_external_get_start_group_lens(keys.len(), atomic_group_lens)?;
++        let self_info = self.view.cluster_manager().get_self_info();
++        if self_info.node_role() != NodeRole::External {
++            return Err(KvError::Api(ApiError::InvalidArgument {
++                detail: "get_start_gpu requires an external node membership".to_string(),
++            }));
++        }
++
++        let mut destination_guards = Vec::with_capacity(destinations.len());
++        let mut external_sink_targets = Vec::with_capacity(destinations.len());
++        for destination in &destinations {
++            let guard = self
++                .view
++                .client_transfer_engine()
++                .validate_gpu_destination(
++                    destination.registration_id,
++                    destination.addr,
++                    destination.capacity,
++                )?;
++            destination_guards.push(guard);
++            external_sink_targets.push(Some(GetExternalSinkTarget {
++                addr: destination.addr,
++                capacity: destination.capacity,
++                registration_id: destination.registration_id,
++                requester_node_start_time: self_info.node_start_time,
++            }));
++        }
++
++        let master_node_id = self
++            .view
++            .cluster_manager()
++            .find_or_wait_master_node()
++            .await?;
++        let resp: MsgPack<BatchGetStartResp> = self
++            .rpc_caller_master_batch_get_start
++            .call(
++                self.view.p2p_module(),
++                master_node_id.into(),
++                MsgPack {
++                    serialize_part: BatchGetStartReq {
++                        keys: keys.clone(),
++                        prepared_targets: Vec::new(),
++                        external_sink_targets,
++                    },
++                    raw_bytes: Vec::new(),
++                },
++                None,
++                0,
++            )
++            .await
++            .map_err(KvError::from)?;
++        crate::rpcresp_kvresult_convert::try_from_code(
++            resp.serialize_part.error_code,
++            resp.serialize_part.error_json.clone(),
++        )?;
++
++        let start_items = resp.serialize_part.items;
++        let started_get_ids = start_items
++            .iter()
++            .filter(|item| item.error_code == OK)
++            .map(|item| item.get_id)
++            .collect::<Vec<_>>();
++        if start_items.len() != keys.len() {
++            let cleanup = self
++                .master_batch_gpu_get_revoke(started_get_ids)
++                .await
++                .err()
++                .map(|err| err.to_string());
++            return Err(KvError::Api(ApiError::Unknown {
++                detail: format!(
++                    "get_start_gpu response length mismatch: expected={} got={} cleanup_error={:?}",
++                    keys.len(),
++                    start_items.len(),
++                    cleanup
++                ),
++            }));
++        }
++
++        for item in &start_items {
++            if item.error_code != OK
++                && item.error_code
++                    != crate::rpcresp_kvresult_convert::msg_and_error::codes_api::API_KEY_NOT_FOUND
++            {
++                let err = crate::rpcresp_kvresult_convert::try_from_code(
++                    item.error_code,
++                    item.error_json.clone(),
++                )
++                .expect_err("non-OK GPU GetStart item must decode as an error");
++                let cleanup = self
++                    .master_batch_gpu_get_revoke(started_get_ids)
++                    .await
++                    .err()
++                    .map(|cleanup_err| cleanup_err.to_string());
++                return Err(KvError::Api(ApiError::Unknown {
++                    detail: format!(
++                        "get_start_gpu item failed: error={} cleanup_error={:?}",
++                        err, cleanup
++                    ),
++                }));
++            }
++        }
++
++        for (idx, ((item, destination), guard)) in start_items
++            .iter()
++            .zip(destinations.iter())
++            .zip(destination_guards.iter())
++            .enumerate()
++        {
++            if item.error_code != OK {
++                continue;
++            }
++            let geometry_is_valid = external_gpu_transfer_plan_geometry_is_valid(
++                item,
++                destination,
++                guard.registration().registration_id,
++            );
++            if !geometry_is_valid || item.node_id == self_info.id {
++                let cleanup = self
++                    .master_batch_gpu_get_revoke(started_get_ids)
++                    .await
++                    .err()
++                    .map(|cleanup_err| cleanup_err.to_string());
++                return Err(KvError::Api(ApiError::Unknown {
++                    detail: format!(
++                        "get_start_gpu invalid master transfer plan: index={} get_id={} source={} target={:#x} base={:#x} len={} destination={:?} cleanup_error={:?}",
++                        idx,
++                        item.get_id,
++                        item.node_id,
++                        item.target_addr,
++                        item.target_base_addr,
++                        item.len,
++                        destination,
++                        cleanup
++                    ),
++                }));
++            }
++        }
++
++        let raw_prefix_hit_len = start_items
++            .iter()
++            .take_while(|item| item.error_code == OK)
++            .count();
++        let transferable_len = compute_external_get_start_transfer_prefix(
++            raw_prefix_hit_len,
++            &group_lens,
++            prefix_best_effort,
++        );
++        let mut transfer_items = Vec::with_capacity(transferable_len);
++        let mut skipped_get_ids = Vec::new();
++        for (idx, (item, guard)) in start_items
++            .into_iter()
++            .zip(destination_guards.into_iter())
++            .enumerate()
++        {
++            if item.error_code != OK {
++                continue;
++            }
++            if idx < transferable_len {
++                transfer_items.push((item, guard));
++            } else {
++                skipped_get_ids.push(item.get_id);
++            }
++        }
++
++        let handle = self.next_gpu_get_handle.fetch_add(1, Ordering::Relaxed);
++        if handle == 0 {
++            let mut all_get_ids = skipped_get_ids.clone();
++            all_get_ids.extend(transfer_items.iter().map(|(item, _)| item.get_id));
++            let _ = self.master_batch_gpu_get_revoke(all_get_ids).await;
++            return Err(KvError::Api(ApiError::Unknown {
++                detail: "get_start_gpu local handle space exhausted".to_string(),
++            }));
++        }
++        let cancel_requested = Arc::new(AtomicBool::new(false));
++        let (terminal_tx, terminal_rx) = watch::channel(None);
++        self.pending_external_gpu_get.insert(
++            handle,
++            PendingExternalGpuGet {
++                transferable_len,
++                atomic_group_lens: group_lens,
++                cancel_requested: cancel_requested.clone(),
++                terminal_rx,
++            },
++        );
++        let view = self.view.clone_view();
++        let view_task = view.clone();
++        view.spawn(format!("external_gpu_get_transfer_{handle}"), async move {
++            let terminal = run_external_gpu_get_transfer(
++                view_task,
++                transfer_items,
++                skipped_get_ids,
++                transfer_concurrency,
++                cancel_requested,
++            )
++            .await;
++            let _ = terminal_tx.send(Some(terminal));
++        });
++        Ok(ExternalGpuGetStartResp {
++            handle,
++            raw_prefix_hit_len,
++        })
++    }
++
++    pub async fn get_transfer_gpu(
++        &self,
++        handle: u64,
++        consume_prefix_len: Option<usize>,
++    ) -> KvResult<ExternalGpuGetTransferResp> {
++        let Some((_, pending)) = self.pending_external_gpu_get.remove(&handle) else {
++            return Err(KvError::Api(ApiError::InvalidArgument {
++                detail: format!("get_transfer_gpu requires a live handle: {handle}"),
++            }));
++        };
++        let consumed_prefix_len = consume_prefix_len.unwrap_or(pending.transferable_len);
++        if let Err(err) = validate_external_get_consume_prefix(
++            consumed_prefix_len,
++            pending.transferable_len,
++            &pending.atomic_group_lens,
++        ) {
++            self.pending_external_gpu_get.insert(handle, pending);
++            return Err(err);
++        }
++        let terminal = wait_external_gpu_get_terminal(pending.terminal_rx).await?;
++        match terminal {
++            ExternalGpuGetTerminal::Completed => Ok(ExternalGpuGetTransferResp {
++                transferred_prefix_len: pending.transferable_len,
++                consumed_prefix_len,
++            }),
++            ExternalGpuGetTerminal::Revoked { transfer_error } => {
++                Err(KvError::Api(ApiError::Unknown {
++                    detail: format!(
++                        "get_transfer_gpu was revoked: handle={} transfer_error={:?}",
++                        handle, transfer_error
++                    ),
++                }))
++            }
++            ExternalGpuGetTerminal::Failed { detail } => {
++                Err(KvError::Api(ApiError::Unknown { detail }))
++            }
++        }
++    }
++
++    pub async fn cancel_get_transfer_gpu(&self, handle: u64) -> KvResult<()> {
++        let Some((_, pending)) = self.pending_external_gpu_get.remove(&handle) else {
++            return Ok(());
++        };
++        pending.cancel_requested.store(true, Ordering::Release);
++        match wait_external_gpu_get_terminal(pending.terminal_rx).await? {
++            ExternalGpuGetTerminal::Completed | ExternalGpuGetTerminal::Revoked { .. } => Ok(()),
++            ExternalGpuGetTerminal::Failed { detail } => {
++                Err(KvError::Api(ApiError::Unknown { detail }))
++            }
++        }
++    }
++
+     pub async fn batch_get_start(
+         &self,
+         keys: Vec<String>,
+diff --git a/fluxon_rs/fluxon_kv/src/lib.rs b/fluxon_rs/fluxon_kv/src/lib.rs
+index 0842a68..a9d38ae 100644
+--- a/fluxon_rs/fluxon_kv/src/lib.rs
++++ b/fluxon_rs/fluxon_kv/src/lib.rs
+@@ -2057,6 +2057,29 @@ async fn run_client_impl(
+             metric_reporter_arg: MetricReporterNewArg {
+                 test_spec_config: config.test_spec_config.clone(),
+             },
++            client_seg_pool_arg: ClientSegPoolNewArg {
++                contribute_size: config.contribute_to_cluster_pool_size.clone(),
++                share_mem_path: config.share_mem_path.clone(),
++                large_file_paths: config.large_file_paths.clone(),
++                cluster_name: config.cluster_name.clone(),
++                etcd_addresses: config.etcd_addresses_raw.clone(),
++                attach_existing_meta: None,
++                side_transfer_worker: false,
++                require_transfer_rpc_fast_path_ready_timeout: None,
++            },
++            client_transfer_engine_arg: ClientTransferEngineNewArg {
++                metadata_uri: config.fluxonkv_spec.etcd_addresses[0].clone(),
++                instance_name: config.instance_key.clone(),
++                enable_transfer_rpc_fast_path: config.fluxonkv_spec.enable_transfer_rpc_fast_path,
++                rpc_port: 12345,
++                protocol_type: config.protocol.protocol_type.clone(),
++                rdma_device_names: transfer_engine_rdma_device_names_from_config(
++                    &config.protocol,
++                    Some(&config.test_spec_config),
++                ),
++                backend_activation_mode: transfer_backend_activation_mode,
++                transfer_engine: config.fluxonkv_spec.transfer_engine.clone(),
++            },
+             external_client_api_arg: ExternalClientApiNewArg {
+                 shared_memory_path: config.share_mem_path.clone(),
+                 shared_file_path: config.share_mem_path.clone(),
+diff --git a/fluxon_rs/fluxon_kv/src/master_kv_router/get.rs b/fluxon_rs/fluxon_kv/src/master_kv_router/get.rs
+index 795a1c4..46c8e2f 100755
+--- a/fluxon_rs/fluxon_kv/src/master_kv_router/get.rs
++++ b/fluxon_rs/fluxon_kv/src/master_kv_router/get.rs
+@@ -6,9 +6,9 @@ use super::{
+         BatchGetDoneItemResp, BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeItemResp,
+         BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq,
+         BatchGetStartResp, BatchIsExistReq, BatchIsExistResp, GetAllocationMode, GetDoneReq,
+-        GetDoneResp, GetMetaReq, GetMetaResp, GetPreparedLocalReserveTarget, GetRevokeReq,
+-        GetRevokeResp, GetStartReq, GetStartResp, MemHolderKeepAliveReq, MemHolderKeepAliveResp,
+-        MemHolderReleaseReq, MemHolderReleaseResp,
++        GetDoneResp, GetExternalSinkTarget, GetMetaReq, GetMetaResp, GetPreparedLocalReserveTarget,
++        GetRevokeReq, GetRevokeResp, GetStartReq, GetStartResp, MemHolderKeepAliveReq,
++        MemHolderKeepAliveResp, MemHolderReleaseReq, MemHolderReleaseResp,
+     },
+     node_generation_is_current_live, publish_route_replica_tomb_fenced,
+     route_maintenance::{RoutePublishEvent, apply_post_route_maintenance_batch},
+@@ -17,12 +17,13 @@ use crate::master_kv_router::OneKvNodesRoutes;
+ use crate::master_kv_router::put::PutIDForAKey;
+ use crate::memholder::MemholderManagerTrait;
+ use crate::{
+-    cluster_manager::NodeID,
++    cluster_manager::{ClusterManagerAccessTrait, NodeID, NodeRole},
+     master_seg_manager::{MasterSegManagerAccessTrait, NodeTombTag, one_seg_allocator::Allocation},
+     p2p::msg_pack::MsgPack,
+     rpcresp_kvresult_convert::msg_and_error::{self, kv},
+ };
+ use dashmap::DashMap;
++use fluxon_commu::share_group_owner_ref_from_metadata;
+ use limit_thirdparty::tokio;
+ use rand::Rng;
+ use rand::seq::SliceRandom;
+@@ -170,6 +171,75 @@ fn validate_prepared_local_reserve_target(
+     ))
+ }
+ 
++fn external_sink_local_owner_id(
++    view: &MasterKvRouterView,
++    req_node_id: &NodeID,
++    requester_node_start_time: i64,
++) -> Option<String> {
++    let requester = view
++        .cluster_manager()
++        .get_member_info_cached(req_node_id.as_ref())?;
++    if requester.node_start_time != requester_node_start_time
++        || requester.node_role() != NodeRole::External
++    {
++        return None;
++    }
++    let owner_ref = share_group_owner_ref_from_metadata(&requester.metadata)?;
++    let owner = view
++        .cluster_manager()
++        .get_member_info_cached(&owner_ref.owner_id)?;
++    (owner.node_start_time == owner_ref.owner_start_time && owner.node_role() == NodeRole::Client)
++        .then_some(owner_ref.owner_id)
++}
++
++fn external_sink_requester_generation_is_current(
++    view: &MasterKvRouterView,
++    req_node_id: &NodeID,
++    requester_node_start_time: i64,
++) -> bool {
++    external_sink_local_owner_id(view, req_node_id, requester_node_start_time).is_some()
++}
++
++fn validate_external_sink_target(
++    view: &MasterKvRouterView,
++    req_node_id: &NodeID,
++    target: &GetExternalSinkTarget,
++    value_len: u64,
++) -> Result<(), msg_and_error::KvError> {
++    let invalid = |detail: String| {
++        msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument { detail })
++    };
++    if target.addr == 0 || target.capacity == 0 || target.registration_id == 0 {
++        return Err(invalid(format!(
++            "external Get sink requires non-zero addr/capacity/registration_id: addr={:#x} capacity={} registration_id={}",
++            target.addr, target.capacity, target.registration_id
++        )));
++    }
++    if target.addr.checked_add(target.capacity).is_none() {
++        return Err(invalid(format!(
++            "external Get sink range overflows: addr={:#x} capacity={}",
++            target.addr, target.capacity
++        )));
++    }
++    if value_len > target.capacity {
++        return Err(invalid(format!(
++            "external Get sink is too small: value_len={} capacity={}",
++            value_len, target.capacity
++        )));
++    }
++    if !external_sink_requester_generation_is_current(
++        view,
++        req_node_id,
++        target.requester_node_start_time,
++    ) {
++        return Err(invalid(format!(
++            "external Get sink requester generation is not current: requester={} start_time={}",
++            req_node_id, target.requester_node_start_time
++        )));
++    }
++    Ok(())
++}
++
+ pub async fn handle_get_start(
+     view: MasterKvRouterView,
+     req: MsgPack<GetStartReq>,
+@@ -218,6 +288,16 @@ pub async fn handle_get_start(
+ 
+     tracing::debug!("Handling GetStartReq: {:?}", req.serialize_part);
+ 
++    if req.serialize_part.prepared_target.is_some()
++        && req.serialize_part.external_sink_target.is_some()
++    {
++        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
++            detail: "GetStart prepared_target and external_sink_target are mutually exclusive"
++                .to_string(),
++        });
++        return failed_resp_err(err, None, &view, &req.serialize_part.key);
++    }
++
+     let activity_lease = match view
+         .master_kv_router()
+         .reserve_inflight_get_key(&req.serialize_part.key)
+@@ -262,6 +342,10 @@ pub async fn handle_get_start(
+ 
+     let replicas: HashMap<NodeID, KvRouteInfo> = one_kv_nodes_routes.nodes_replicas.read().clone();
+     let prepared_target = req.serialize_part.prepared_target.clone();
++    let external_sink_target = req.serialize_part.external_sink_target.clone();
++    let external_sink_local_owner = external_sink_target.as_ref().and_then(|target| {
++        external_sink_local_owner_id(&view, &req_node_id, target.requester_node_start_time)
++    });
+     // Currently we are holding the lock with `replicas`
+     // 选择一个replica (这里可以实现更复杂的选择逻辑)
+     let mut replica_keys = replicas.keys().collect::<Vec<_>>();
+@@ -277,6 +361,16 @@ pub async fn handle_get_start(
+             tombs.insert(selected_replica_key.to_owned());
+             continue;
+         }
++        if external_sink_local_owner
++            .as_deref()
++            .is_some_and(|owner_id| selected_replica.node_id.as_ref() == owner_id)
++        {
++            // The explicit GPU path is RDMA-only. The requester's share-group
++            // owner is local IPC/P2P topology, whose fallback would require
++            // CPU access to a CUDA virtual address. Leave that replica for the
++            // ordinary CPU-buffered Get path and search for a remote route.
++            continue;
++        }
+         let src_node_id = selected_replica.node_id.clone();
+         let src_len = selected_replica.backing.len();
+         let src_abs_addr = selected_replica.backing.abs_addr();
+@@ -354,34 +448,14 @@ pub async fn handle_get_start(
+ 
+         // 为get调用方分配接收内存作为传输target
+         if target.is_none() {
+-            target = Some(if let Some(prepared_target) = prepared_target.as_ref() {
+-                if replicas
+-                    .get(&req_node_id)
+-                    .is_some_and(|replica| !replica.tomb_tag.is_tomb())
+-                {
+-                    let err = msg_and_error::KvError::Api(
+-                        msg_and_error::ApiError::InvalidArgument {
+-                            detail: format!(
+-                                "prepared local-reserve Get target cannot replace a live replica: key={} requester={}",
+-                                req.serialize_part.key, req_node_id
+-                            ),
+-                        },
+-                    );
+-                    return failed_resp_err(
+-                        err,
+-                        Some((tombs.clone(), one_kv_nodes_routes.put_id)),
++            target = Some(
++                if let Some(external_sink_target) = external_sink_target.as_ref() {
++                    if let Err(err) = validate_external_sink_target(
+                         &view,
+-                        &req.serialize_part.key,
+-                    );
+-                }
+-                let (slot, _prepared_tomb_tag) = match validate_prepared_local_reserve_target(
+-                    &view,
+-                    &req_node_id,
+-                    prepared_target,
+-                    src_len,
+-                ) {
+-                    Ok(slot) => slot,
+-                    Err(err) => {
++                        &req_node_id,
++                        external_sink_target,
++                        src_len,
++                    ) {
+                         return failed_resp_err(
+                             err,
+                             Some((tombs.clone(), one_kv_nodes_routes.put_id)),
+@@ -389,26 +463,66 @@ pub async fn handle_get_start(
+                             &req.serialize_part.key,
+                         );
+                     }
+-                };
+-                allocation_mode = GetAllocationMode::LocalCommittedSlot;
+-                InflightGetTarget::PreparedLocalReserveSlot(slot)
+-            } else if let Some(replica_on_recv_node) = replicas.get(&req_node_id) {
+-                match &replica_on_recv_node.backing {
+-                    super::KvReplicaBacking::Allocation(allocation) => {
+-                        allocation_mode = GetAllocationMode::ReuseReplica;
+-                        InflightGetTarget::Allocation(allocation.clone())
++                    allocation_mode = GetAllocationMode::ExternalSink;
++                    InflightGetTarget::ExternalSink(external_sink_target.clone())
++                } else if let Some(prepared_target) = prepared_target.as_ref() {
++                    if replicas
++                        .get(&req_node_id)
++                        .is_some_and(|replica| !replica.tomb_tag.is_tomb())
++                    {
++                        let err = msg_and_error::KvError::Api(
++                            msg_and_error::ApiError::InvalidArgument {
++                                detail: format!(
++                                    "prepared local-reserve Get target cannot replace a live replica: key={} requester={}",
++                                    req.serialize_part.key, req_node_id
++                                ),
++                            },
++                        );
++                        return failed_resp_err(
++                            err,
++                            Some((tombs.clone(), one_kv_nodes_routes.put_id)),
++                            &view,
++                            &req.serialize_part.key,
++                        );
+                     }
+-                    super::KvReplicaBacking::CommittedSlot(_) => match allocate_request_target() {
++                    let (slot, _prepared_tomb_tag) = match validate_prepared_local_reserve_target(
++                        &view,
++                        &req_node_id,
++                        prepared_target,
++                        src_len,
++                    ) {
++                        Ok(slot) => slot,
++                        Err(err) => {
++                            return failed_resp_err(
++                                err,
++                                Some((tombs.clone(), one_kv_nodes_routes.put_id)),
++                                &view,
++                                &req.serialize_part.key,
++                            );
++                        }
++                    };
++                    allocation_mode = GetAllocationMode::LocalCommittedSlot;
++                    InflightGetTarget::PreparedLocalReserveSlot(slot)
++                } else if let Some(replica_on_recv_node) = replicas.get(&req_node_id) {
++                    match &replica_on_recv_node.backing {
++                        super::KvReplicaBacking::Allocation(allocation) => {
++                            allocation_mode = GetAllocationMode::ReuseReplica;
++                            InflightGetTarget::Allocation(allocation.clone())
++                        }
++                        super::KvReplicaBacking::CommittedSlot(_) => {
++                            match allocate_request_target() {
++                                Ok(allocation) => allocation,
++                                Err(resp) => return resp,
++                            }
++                        }
++                    }
++                } else {
++                    match allocate_request_target() {
+                         Ok(allocation) => allocation,
+                         Err(resp) => return resp,
+-                    },
+-                }
+-            } else {
+-                match allocate_request_target() {
+-                    Ok(allocation) => allocation,
+-                    Err(resp) => return resp,
+-                }
+-            });
++                    }
++                },
++            );
+         }
+ 
+         let target = target
+@@ -433,8 +547,9 @@ pub async fn handle_get_start(
+                         && node_generation_is_current_live(&view, &req_node_id, &grant.tomb_tag))
+                     .then(|| grant.tomb_tag.clone())
+                 }),
++            InflightGetTarget::ExternalSink(_) => None,
+         };
+-        let Some(target_tomb_tag) = target_tomb_tag else {
++        if !matches!(&target, InflightGetTarget::ExternalSink(_)) && target_tomb_tag.is_none() {
+             let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                 detail: format!(
+                     "Get target generation changed before start publication: get_id={} key={} requester={}",
+@@ -447,7 +562,7 @@ pub async fn handle_get_start(
+                 &view,
+                 &req.serialize_part.key,
+             );
+-        };
++        }
+ 
+         // Convert to absolute addresses for Mooncake (requires absolute)
+         // Use allocation's allocator base directly
+@@ -704,7 +819,88 @@ async fn handle_get_done_locked(
+         let req_node_id = inflight_info.req_node_id.clone();
+         let key = inflight_info.key;
+         let target_cap = inflight_info.target.capacity();
+-        if !node_generation_is_current_live(&view, &req_node_id, &inflight_info.target_tomb_tag) {
++        if allocation_mode == GetAllocationMode::ExternalSink {
++            let generation_is_current = match &inflight_info.target {
++                InflightGetTarget::ExternalSink(target) => {
++                    external_sink_requester_generation_is_current(
++                        &view,
++                        &req_node_id,
++                        target.requester_node_start_time,
++                    )
++                }
++                _ => false,
++            };
++            let terminal = if generation_is_current {
++                view.master_kv_router()
++                    .view()
++                    .metric_reporter()
++                    .metrics()
++                    .inc_kv_get_done_allocation("external_sink");
++                GetDoneResp {
++                    holder_id: 0,
++                    allocation_mode: GetAllocationMode::ExternalSink,
++                    error_code: msg_and_error::OK,
++                    error_json: String::new(),
++                    server_process_us: 0,
++                }
++            } else {
++                let err = msg_and_error::KvError::Api(
++                    msg_and_error::ApiError::InvalidPutMasterState {
++                        detail: format!(
++                            "external Get sink requester generation departed before Done: get_id={} key={} requester={}",
++                            get_id, key, req_node_id
++                        ),
++                    },
++                );
++                crate::rpcresp_kvresult_convert::FromError::from_error(&err)
++            };
++            let completed = CompletedGetInfo {
++                req_node_id: req_node_id.clone(),
++                response: terminal.clone(),
++            };
++            if let Some(terminals) = deferred_terminals.as_deref_mut() {
++                terminals.push((get_id, completed));
++            } else {
++                view.master_kv_router()
++                    .inner()
++                    .completed_gets
++                    .insert(get_id, completed)
++                    .await;
++            }
++            return MsgPack {
++                serialize_part: terminal,
++                raw_bytes: Vec::new(),
++            };
++        }
++
++        let Some(target_tomb_tag) = inflight_info.target_tomb_tag.as_ref() else {
++            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
++                detail: format!(
++                    "allocator-backed Get lost its target generation: get_id={} key={} requester={}",
++                    get_id, key, req_node_id
++                ),
++            });
++            let terminal: GetDoneResp =
++                crate::rpcresp_kvresult_convert::FromError::from_error(&err);
++            let completed = CompletedGetInfo {
++                req_node_id: req_node_id.clone(),
++                response: terminal.clone(),
++            };
++            if let Some(terminals) = deferred_terminals.as_deref_mut() {
++                terminals.push((get_id, completed));
++            } else {
++                view.master_kv_router()
++                    .inner()
++                    .completed_gets
++                    .insert(get_id, completed)
++                    .await;
++            }
++            return MsgPack {
++                serialize_part: terminal,
++                raw_bytes: Vec::new(),
++            };
++        };
++        if !node_generation_is_current_live(&view, &req_node_id, target_tomb_tag) {
+             let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                 detail: format!(
+                     "GetDone target generation departed: get_id={} key={} requester={}",
+@@ -757,12 +953,15 @@ async fn handle_get_done_locked(
+                 holder_id
+             }
+             InflightGetTarget::PreparedLocalReserveSlot(_) => 0,
++            InflightGetTarget::ExternalSink(_) => {
++                unreachable!("external Get sink must complete before holder publication")
++            }
+         };
+ 
+         // Close the insertion-vs-MemberLeft cleanup race for the holder.  If
+         // MemberLeft marked the shared tag before this check, remove the exact
+         // holder we just inserted.  Otherwise its later cleanup must observe it.
+-        if inflight_info.target_tomb_tag.is_tomb() {
++        if target_tomb_tag.is_tomb() {
+             if let Some(holder_key) = inserted_holder_key.as_ref() {
+                 view.master_kv_router()
+                     .inner()
+@@ -809,7 +1008,7 @@ async fn handle_get_done_locked(
+                 if one_kv_nodes_routes.put_id == inflight_info.put_id {
+                     match view.master_kv_router().reserve_node_cache_capacity(
+                         &req_node_id,
+-                        &inflight_info.target_tomb_tag,
++                        target_tomb_tag,
+                         ReservedCapacityReason::OwnerIndexedAllocation,
+                         target_cap,
+                     ) {
+@@ -823,11 +1022,14 @@ async fn handle_get_done_locked(
+                                     InflightGetTarget::PreparedLocalReserveSlot(_) => {
+                                         unreachable!("durable Get mode must use Allocation target")
+                                     }
++                                    InflightGetTarget::ExternalSink(_) => {
++                                        unreachable!("durable Get mode cannot use external sink")
++                                    }
+                                 }),
+                                 owner_local_indexed: true,
+                                 get_durable_reservation: inflight_info.durable_reservation.clone(),
+                                 capacity_reservation,
+-                                tomb_tag: inflight_info.target_tomb_tag.clone(),
++                                tomb_tag: target_tomb_tag.clone(),
+                             };
+                             if publish_route_replica_tomb_fenced(
+                                 &one_kv_nodes_routes,
+@@ -888,7 +1090,7 @@ async fn handle_get_done_locked(
+             let mut route_lease_id = None;
+             let capacity_reservation = view.master_kv_router().reserve_node_cache_capacity(
+                 &req_node_id,
+-                &inflight_info.target_tomb_tag,
++                target_tomb_tag,
+                 ReservedCapacityReason::OwnerIndexedAllocation,
+                 target_cap,
+             );
+@@ -906,9 +1108,7 @@ async fn handle_get_done_locked(
+                             let mut replicas = current_route.nodes_replicas.write();
+                             if let Some(replica) = replicas.get_mut(&req_node_id) {
+                                 local_index_published = !replica.tomb_tag.is_tomb()
+-                                    && replica
+-                                        .tomb_tag
+-                                        .same_generation(&inflight_info.target_tomb_tag)
++                                    && replica.tomb_tag.same_generation(target_tomb_tag)
+                                     && matches!(
+                                         &replica.backing,
+                                         super::KvReplicaBacking::Allocation(allocation)
+@@ -977,6 +1177,9 @@ async fn handle_get_done_locked(
+                 InflightGetTarget::Allocation(_) => {
+                     unreachable!("local committed-slot Get mode must use a prepared slot")
+                 }
++                InflightGetTarget::ExternalSink(_) => {
++                    unreachable!("local committed-slot Get mode cannot use external sink")
++                }
+             };
+             let mut published = false;
+             let mut route_publish_event = None;
+@@ -988,7 +1191,7 @@ async fn handle_get_done_locked(
+                         owner_local_indexed: true,
+                         get_durable_reservation: None,
+                         capacity_reservation: None,
+-                        tomb_tag: inflight_info.target_tomb_tag.clone(),
++                        tomb_tag: target_tomb_tag.clone(),
+                     };
+                     if publish_route_replica_tomb_fenced(
+                         &current_route,
+@@ -1056,6 +1259,7 @@ async fn handle_get_done_locked(
+                 GetAllocationMode::ReuseReplica => "reuse_replica",
+                 GetAllocationMode::DurableReplica => "durable_replica",
+                 GetAllocationMode::LocalCommittedSlot => "local_committed_slot",
++                GetAllocationMode::ExternalSink => "external_sink",
+             });
+ 
+         let terminal = GetDoneResp {
+@@ -1343,6 +1547,7 @@ pub async fn handle_batch_get_start(
+     let BatchGetStartReq {
+         keys,
+         prepared_targets,
++        external_sink_targets,
+     } = req.serialize_part;
+     if !prepared_targets.is_empty() && prepared_targets.len() != keys.len() {
+         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+@@ -1363,19 +1568,48 @@ pub async fn handle_batch_get_start(
+             raw_bytes: Vec::new(),
+         };
+     }
++    if !external_sink_targets.is_empty() && external_sink_targets.len() != keys.len() {
++        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
++            detail: format!(
++                "batch_get_start external sink target length mismatch: keys={} targets={}",
++                keys.len(),
++                external_sink_targets.len()
++            ),
++        });
++        let error: GetStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(&err);
++        return MsgPack {
++            serialize_part: BatchGetStartResp {
++                items: Vec::new(),
++                error_code: error.error_code,
++                error_json: error.error_json,
++                server_process_us: 0,
++            },
++            raw_bytes: Vec::new(),
++        };
++    }
+     let prepared_targets = if prepared_targets.is_empty() {
+         vec![None; keys.len()]
+     } else {
+         prepared_targets
+     };
++    let external_sink_targets = if external_sink_targets.is_empty() {
++        vec![None; keys.len()]
++    } else {
++        external_sink_targets
++    };
+     let mut items = Vec::with_capacity(keys.len());
+-    for (key, prepared_target) in keys.into_iter().zip(prepared_targets) {
++    for ((key, prepared_target), external_sink_target) in keys
++        .into_iter()
++        .zip(prepared_targets)
++        .zip(external_sink_targets)
++    {
+         let (_get_id, resp) = handle_get_start(
+             view.clone(),
+             MsgPack {
+                 serialize_part: GetStartReq {
+                     key,
+                     prepared_target,
++                    external_sink_target,
+                 },
+                 raw_bytes: Vec::new(),
+             },
+diff --git a/fluxon_rs/fluxon_kv/src/master_kv_router/mod.rs b/fluxon_rs/fluxon_kv/src/master_kv_router/mod.rs
+index 3939fb2..9f927d9 100644
+--- a/fluxon_rs/fluxon_kv/src/master_kv_router/mod.rs
++++ b/fluxon_rs/fluxon_kv/src/master_kv_router/mod.rs
+@@ -431,8 +431,10 @@ pub struct InflightGetInfo {
+     pub req_node_id: NodeID,
+     pub len: u64,
+     pub target: InflightGetTarget,
+-    /// Exact requester registration generation that owns `target`.
+-    pub target_tomb_tag: NodeTombTag,
++    /// Exact requester segment-registration generation that owns an
++    /// allocator-backed target. External sinks are caller-owned and instead
++    /// carry their membership generation inside `InflightGetTarget`.
++    pub target_tomb_tag: Option<NodeTombTag>,
+     pub route: Arc<OneKvNodesRoutes>,
+     pub allocation_mode: GetAllocationMode,
+     pub durable_reservation: Option<Arc<GetDurableSlotReservation>>,
+@@ -453,6 +455,7 @@ pub struct CompletedGetInfo {
+ pub enum InflightGetTarget {
+     Allocation(Arc<Allocation>),
+     PreparedLocalReserveSlot(CommittedSlotReplica),
++    ExternalSink(crate::master_kv_router::msg_pack::GetExternalSinkTarget),
+ }
+ 
+ impl InflightGetTarget {
+@@ -460,6 +463,7 @@ impl InflightGetTarget {
+         match self {
+             Self::Allocation(allocation) => allocation.base_addr() + allocation.addr(),
+             Self::PreparedLocalReserveSlot(slot) => slot.addr,
++            Self::ExternalSink(target) => target.addr,
+         }
+     }
+ 
+@@ -467,6 +471,7 @@ impl InflightGetTarget {
+         match self {
+             Self::Allocation(allocation) => allocation.base_addr(),
+             Self::PreparedLocalReserveSlot(slot) => slot.base_addr,
++            Self::ExternalSink(target) => target.addr,
+         }
+     }
+ 
+@@ -474,6 +479,7 @@ impl InflightGetTarget {
+         match self {
+             Self::Allocation(allocation) => allocation.capcity(),
+             Self::PreparedLocalReserveSlot(slot) => slot.slot_size,
++            Self::ExternalSink(target) => target.capacity,
+         }
+     }
+ }
+@@ -4506,6 +4512,7 @@ impl MasterKvRouter {
+             GetAllocationMode::ReuseReplica => "reuse_replica",
+             GetAllocationMode::DurableReplica => "durable_replica",
+             GetAllocationMode::LocalCommittedSlot => "local_committed_slot",
++            GetAllocationMode::ExternalSink => "external_sink",
+         };
+         let mode_count = self
+             .inner()
+diff --git a/fluxon_rs/fluxon_kv/src/master_kv_router/msg_pack.rs b/fluxon_rs/fluxon_kv/src/master_kv_router/msg_pack.rs
+index 7ba3eb0..d21e39d 100755
+--- a/fluxon_rs/fluxon_kv/src/master_kv_router/msg_pack.rs
++++ b/fluxon_rs/fluxon_kv/src/master_kv_router/msg_pack.rs
+@@ -18,6 +18,9 @@ pub enum GetAllocationMode {
+     ReuseReplica = 1,
+     DurableReplica = 2,
+     LocalCommittedSlot = 3,
++    /// Caller-owned memory used only as the terminal data sink. The master
++    /// neither allocates it nor publishes it as a cache route on GetDone.
++    ExternalSink = 4,
+ }
+ 
+ #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+@@ -29,10 +32,24 @@ pub struct GetPreparedLocalReserveTarget {
+     pub base_addr: u64,
+ }
+ 
++#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
++pub struct GetExternalSinkTarget {
++    /// Exact destination address in the requester's registered memory.
++    pub addr: u64,
++    /// Caller-validated writable bytes starting at `addr`.
++    pub capacity: u64,
++    /// Opaque requester-side registration generation, retained for identity
++    /// and observability. The requester remains authoritative for MR lifetime.
++    pub registration_id: u64,
++    /// Requester membership generation captured with the GPU registration.
++    pub requester_node_start_time: i64,
++}
++
+ #[derive(Default, Debug, Clone, Encode, Decode)]
+ pub struct GetStartReq {
+     pub key: String,
+     pub prepared_target: Option<GetPreparedLocalReserveTarget>,
++    pub external_sink_target: Option<GetExternalSinkTarget>,
+ }
+ impl MsgPackSerializePart for GetStartReq {
+     fn msg_id(&self) -> u32 {
+@@ -124,6 +141,9 @@ pub struct BatchGetStartReq {
+     /// Empty selects ordinary master allocations. Otherwise this must contain
+     /// exactly one entry per key.
+     pub prepared_targets: Vec<Option<GetPreparedLocalReserveTarget>>,
++    /// Empty selects no external sinks. Otherwise this must contain exactly
++    /// one entry per key and is mutually exclusive with prepared targets.
++    pub external_sink_targets: Vec<Option<GetExternalSinkTarget>>,
+ }
+ impl MsgPackSerializePart for BatchGetStartReq {
+     fn msg_id(&self) -> u32 {
+diff --git a/fluxon_rs/fluxon_pyo3/src/lib.rs b/fluxon_rs/fluxon_pyo3/src/lib.rs
+index be1a652..d849e62 100644
+--- a/fluxon_rs/fluxon_pyo3/src/lib.rs
++++ b/fluxon_rs/fluxon_pyo3/src/lib.rs
+@@ -25,6 +25,7 @@ use fluxon_kv::client_kv_api::{
+     ClientKvApiInner, OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerLocalReserveSlotLease,
+ };
+ use fluxon_kv::client_seg_pool::ClientSegPoolViewTrait;
++use fluxon_kv::client_transfer_engine::ClientTransferEngineAccessTrait;
+ use fluxon_kv::cluster_manager::ClusterManagerViewTrait;
+ use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+ use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
+@@ -4770,6 +4771,263 @@ impl KvClient {
+         cancel_get_transfer_inner(self, handle, py).into_py_object(py)
+     }
+ 
++    /// Start background RDMA pulls directly into caller-owned GPU destinations.
++    #[pyo3(signature = (keys, destinations, prefix_best_effort=true, atomic_group_lens=None, concurrency=None))]
++    fn get_start_gpu(
++        &self,
++        keys: Vec<String>,
++        destinations: Vec<(u64, u64, u64)>,
++        prefix_best_effort: bool,
++        atomic_group_lens: Option<Vec<usize>>,
++        concurrency: Option<usize>,
++        py: Python,
++    ) -> PyObject {
++        fn get_start_gpu_inner(
++            client: &KvClient,
++            keys: Vec<String>,
++            destinations: Vec<(u64, u64, u64)>,
++            prefix_best_effort: bool,
++            atomic_group_lens: Option<Vec<usize>>,
++            concurrency: Option<usize>,
++            py: Python,
++        ) -> ApiResult<PyObject> {
++            if keys.is_empty() {
++                return ApiResult::new_error(new_invalid_argument_error(
++                    py,
++                    "get_start_gpu requires at least one key",
++                ));
++            }
++            if keys.len() != destinations.len() {
++                return ApiResult::new_error(new_invalid_argument_error(
++                    py,
++                    "get_start_gpu requires one destination per key",
++                ));
++            }
++            let batch_concurrency = match concurrency.unwrap_or(DEFAULT_PYO3_BATCH_CONCURRENCY) {
++                0 => {
++                    return ApiResult::new_error(new_invalid_argument_error(
++                        py,
++                        "get_start_gpu concurrency must be > 0",
++                    ));
++                }
++                value => value,
++            };
++            let framework = match require_kv_framework_api(client, py) {
++                Ok(value) => value,
++                Err(err) => return ApiResult::new_error(err),
++            };
++            if !framework.is_external_mode() {
++                return ApiResult::new_error(new_invalid_argument_error(
++                    py,
++                    "get_start_gpu is supported only in external-client mode",
++                ));
++            }
++            let runtime = match client.runtime.as_ref() {
++                Some(value) => value,
++                None => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        "Client runtime is missing",
++                    ));
++                }
++            };
++            let destinations = destinations
++                .into_iter()
++                .map(|(registration_id, addr, capacity)| {
++                    fluxon_kv::external_client_api::ExternalGpuDestination {
++                        registration_id,
++                        addr,
++                        capacity,
++                    }
++                })
++                .collect();
++            let framework_for_start = framework.clone();
++            let result = match py.allow_threads(|| {
++                runtime.run_async_from_sync(async move {
++                    framework_for_start
++                        .external_client_api_view()
++                        .external_client_api()
++                        .inner()
++                        .get_start_gpu(
++                            keys,
++                            destinations,
++                            prefix_best_effort,
++                            atomic_group_lens,
++                            batch_concurrency,
++                        )
++                        .await
++                })
++            }) {
++                Ok(value) => value,
++                Err(err) => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        &format!("runtime bridge failed: {err}"),
++                    ));
++                }
++            };
++            match result {
++                Ok(started) => {
++                    let out = PyDict::new_bound(py);
++                    out.set_item("handle", started.handle).expect("set handle");
++                    out.set_item("raw_prefix_hit_len", started.raw_prefix_hit_len as u64)
++                        .expect("set raw_prefix_hit_len");
++                    ApiResult::new_success(out.into_py(py))
++                }
++                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
++                    py,
++                    &err,
++                    "get_start_gpu failed",
++                )),
++            }
++        }
++
++        get_start_gpu_inner(
++            self,
++            keys,
++            destinations,
++            prefix_best_effort,
++            atomic_group_lens,
++            concurrency,
++            py,
++        )
++        .into_py_object(py)
++    }
++
++    /// Wait for a GPU Get terminal and consume an atomic prefix.
++    #[pyo3(signature = (handle, consume_prefix_len=None))]
++    fn get_transfer_gpu(
++        &self,
++        handle: u64,
++        consume_prefix_len: Option<usize>,
++        py: Python,
++    ) -> PyObject {
++        fn get_transfer_gpu_inner(
++            client: &KvClient,
++            handle: u64,
++            consume_prefix_len: Option<usize>,
++            py: Python,
++        ) -> ApiResult<PyObject> {
++            let framework = match require_kv_framework_api(client, py) {
++                Ok(value) => value,
++                Err(err) => return ApiResult::new_error(err),
++            };
++            if !framework.is_external_mode() {
++                return ApiResult::new_error(new_invalid_argument_error(
++                    py,
++                    "get_transfer_gpu is supported only in external-client mode",
++                ));
++            }
++            let runtime = match client.runtime.as_ref() {
++                Some(value) => value,
++                None => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        "Client runtime is missing",
++                    ));
++                }
++            };
++            let framework_for_transfer = framework.clone();
++            let result = match py.allow_threads(|| {
++                runtime.run_async_from_sync(async move {
++                    framework_for_transfer
++                        .external_client_api_view()
++                        .external_client_api()
++                        .inner()
++                        .get_transfer_gpu(handle, consume_prefix_len)
++                        .await
++                })
++            }) {
++                Ok(value) => value,
++                Err(err) => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        &format!("runtime bridge failed: {err}"),
++                    ));
++                }
++            };
++            match result {
++                Ok(terminal) => {
++                    let out = PyDict::new_bound(py);
++                    out.set_item(
++                        "transferred_prefix_len",
++                        terminal.transferred_prefix_len as u64,
++                    )
++                    .expect("set transferred_prefix_len");
++                    out.set_item("consumed_prefix_len", terminal.consumed_prefix_len as u64)
++                        .expect("set consumed_prefix_len");
++                    ApiResult::new_success(out.into_py(py))
++                }
++                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
++                    py,
++                    &err,
++                    "get_transfer_gpu failed",
++                )),
++            }
++        }
++
++        get_transfer_gpu_inner(self, handle, consume_prefix_len, py).into_py_object(py)
++    }
++
++    /// Cancel a live GPU Get handle and wait until master cleanup is terminal.
++    #[pyo3(signature = (handle))]
++    fn cancel_get_transfer_gpu(&self, handle: u64, py: Python) -> PyObject {
++        fn cancel_get_transfer_gpu_inner(
++            client: &KvClient,
++            handle: u64,
++            py: Python,
++        ) -> ApiResult<PyObject> {
++            let framework = match require_kv_framework_api(client, py) {
++                Ok(value) => value,
++                Err(err) => return ApiResult::new_error(err),
++            };
++            if !framework.is_external_mode() {
++                return ApiResult::new_error(new_invalid_argument_error(
++                    py,
++                    "cancel_get_transfer_gpu is supported only in external-client mode",
++                ));
++            }
++            let runtime = match client.runtime.as_ref() {
++                Some(value) => value,
++                None => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        "Client runtime is missing",
++                    ));
++                }
++            };
++            let framework_for_cancel = framework.clone();
++            let result = match py.allow_threads(|| {
++                runtime.run_async_from_sync(async move {
++                    framework_for_cancel
++                        .external_client_api_view()
++                        .external_client_api()
++                        .inner()
++                        .cancel_get_transfer_gpu(handle)
++                        .await
++                })
++            }) {
++                Ok(value) => value,
++                Err(err) => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        &format!("runtime bridge failed: {err}"),
++                    ));
++                }
++            };
++            match result {
++                Ok(()) => ApiResult::new_success(0i32.into_py(py)),
++                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
++                    py,
++                    &err,
++                    "cancel_get_transfer_gpu failed",
++                )),
++            }
++        }
++
++        cancel_get_transfer_gpu_inner(self, handle, py).into_py_object(py)
++    }
++
+     /// Allocate a fluxon-kv lease id synchronously.
+     /// Always allocate a new lease id (no reuse by requested id).
+     /// Allocate with the provided TTL seconds (must be >= MIN_CLIENT_TTL_SECONDS).
+@@ -5371,6 +5629,176 @@ impl KvClient {
+         .into_py_object(py)
+     }
+ 
++    /// Register one caller-owned GPU staging range with the transfer engine.
++    #[pyo3(signature = (ptr, len, device_id))]
++    fn register_gpu_buffer(&self, ptr: u64, len: u64, device_id: u32, py: Python) -> PyObject {
++        fn register_gpu_buffer_inner(
++            client: &KvClient,
++            ptr: u64,
++            len: u64,
++            device_id: u32,
++            py: Python,
++        ) -> ApiResult<PyObject> {
++            let framework = match require_kv_framework_api(client, py) {
++                Ok(v) => v,
++                Err(e) => return ApiResult::new_error(e),
++            };
++            if !framework.is_external_mode() {
++                return ApiResult::new_error(new_invalid_argument_error(
++                    py,
++                    "register_gpu_buffer is supported only in external-client mode",
++                ));
++            }
++            let runtime = match client.runtime.as_ref() {
++                Some(v) => v,
++                None => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        "Client runtime is missing",
++                    ));
++                }
++            };
++            let framework_for_register = framework.clone();
++            let result = match py.allow_threads(|| {
++                runtime.run_async_from_sync(async move {
++                    framework_for_register
++                        .client_seg_pool_view()
++                        .client_transfer_engine()
++                        .register_gpu_memory(ptr, len, device_id)
++                        .await
++                })
++            }) {
++                Ok(v) => v,
++                Err(e) => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        &format!("runtime bridge failed: {}", e),
++                    ));
++                }
++            };
++            match result {
++                Ok(registration) => {
++                    let out = PyDict::new_bound(py);
++                    out.set_item("registration_id", registration.registration_id)
++                        .expect("set registration_id");
++                    out.set_item("ptr", registration.addr).expect("set ptr");
++                    out.set_item("len", registration.len).expect("set len");
++                    out.set_item("device_id", registration.device_id)
++                        .expect("set device_id");
++                    ApiResult::new_success(out.into_py(py))
++                }
++                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
++                    py,
++                    &err,
++                    "register_gpu_buffer failed",
++                )),
++            }
++        }
++
++        register_gpu_buffer_inner(self, ptr, len, device_id, py).into_py_object(py)
++    }
++
++    /// Unregister a GPU staging range after every destination guard is released.
++    #[pyo3(signature = (registration_id))]
++    fn unregister_gpu_buffer(&self, registration_id: u64, py: Python) -> PyObject {
++        fn unregister_gpu_buffer_inner(
++            client: &KvClient,
++            registration_id: u64,
++            py: Python,
++        ) -> ApiResult<PyObject> {
++            let framework = match require_kv_framework_api(client, py) {
++                Ok(v) => v,
++                Err(e) => return ApiResult::new_error(e),
++            };
++            if !framework.is_external_mode() {
++                return ApiResult::new_error(new_invalid_argument_error(
++                    py,
++                    "unregister_gpu_buffer is supported only in external-client mode",
++                ));
++            }
++            let runtime = match client.runtime.as_ref() {
++                Some(v) => v,
++                None => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        "Client runtime is missing",
++                    ));
++                }
++            };
++            let framework_for_unregister = framework.clone();
++            let result = match py.allow_threads(|| {
++                runtime.run_async_from_sync(async move {
++                    framework_for_unregister
++                        .client_seg_pool_view()
++                        .client_transfer_engine()
++                        .unregister_gpu_memory(registration_id)
++                        .await
++                })
++            }) {
++                Ok(v) => v,
++                Err(e) => {
++                    return ApiResult::new_error(new_general_error(
++                        py,
++                        &format!("runtime bridge failed: {}", e),
++                    ));
++                }
++            };
++            match result {
++                Ok(()) => ApiResult::new_success(0i32.into_py(py)),
++                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
++                    py,
++                    &err,
++                    "unregister_gpu_buffer failed",
++                )),
++            }
++        }
++
++        unregister_gpu_buffer_inner(self, registration_id, py).into_py_object(py)
++    }
++
++    /// Validate one destination against the exact GPU registration generation.
++    #[pyo3(signature = (registration_id, ptr, capacity))]
++    fn validate_gpu_destination(
++        &self,
++        registration_id: u64,
++        ptr: u64,
++        capacity: u64,
++        py: Python,
++    ) -> PyObject {
++        fn validate_gpu_destination_inner(
++            client: &KvClient,
++            registration_id: u64,
++            ptr: u64,
++            capacity: u64,
++            py: Python,
++        ) -> ApiResult<PyObject> {
++            let framework = match require_kv_framework_api(client, py) {
++                Ok(v) => v,
++                Err(e) => return ApiResult::new_error(e),
++            };
++            if !framework.is_external_mode() {
++                return ApiResult::new_error(new_invalid_argument_error(
++                    py,
++                    "validate_gpu_destination is supported only in external-client mode",
++                ));
++            }
++            match framework
++                .client_seg_pool_view()
++                .client_transfer_engine()
++                .validate_gpu_destination(registration_id, ptr, capacity)
++            {
++                Ok(_guard) => ApiResult::new_success(0i32.into_py(py)),
++                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
++                    py,
++                    &err,
++                    "validate_gpu_destination failed",
++                )),
++            }
++        }
++
++        validate_gpu_destination_inner(self, registration_id, ptr, capacity, py).into_py_object(py)
++    }
++
+     /// Register a caller-owned host buffer range used by batch zero-copy paths.
+     #[pyo3(signature = (ptr, len))]
+     fn register_buffer(&self, ptr: u64, len: u64, py: Python) -> PyObject {
+diff --git a/setup_and_pack/nix/pack_fluxonkv_pylib.py b/setup_and_pack/nix/pack_fluxonkv_pylib.py
+index e12f8fe..cb0af6d 100644
+--- a/setup_and_pack/nix/pack_fluxonkv_pylib.py
++++ b/setup_and_pack/nix/pack_fluxonkv_pylib.py
+@@ -198,6 +198,11 @@ MANYLINUX_CXX_RUNTIME_LIBRARY_NAMES = (
+     "libstdc++.so.6",
+     "libgomp.so.1",
+ )
++EXTERNAL_DRIVER_RUNTIME_LIBRARY_NAMES = (
++    # libcuda is supplied by the NVIDIA kernel-driver installation on the target GPU node.
++    # Packaging the build-time stub would make the wheel non-functional at runtime.
++    "libcuda.so.1",
++)
+ 
+ def _dedupe_relative_paths(relative_paths: tuple[str, ...]) -> tuple[str, ...]:
+     ordered_relative_paths: list[str] = []
+@@ -2273,6 +2278,10 @@ def _is_core_system_runtime_lib(lib_name: str) -> bool:
+     return any(lib_name.startswith(prefix) for prefix in CORE_SYSTEM_RUNTIME_LIB_PREFIXES)
+ 
+ 
++def _is_external_driver_runtime_lib(lib_name: str) -> bool:
++    return lib_name in EXTERNAL_DRIVER_RUNTIME_LIBRARY_NAMES
++
++
+ def _read_runtime_dependency_entries(
+     path: Path,
+     *,
+@@ -2314,6 +2323,12 @@ def _read_runtime_dependency_entries(
+         if "=>" in line:
+             needed_name, raw_target = (part.strip() for part in line.split("=>", 1))
+             if raw_target == "not found":
++                if _is_external_driver_runtime_lib(needed_name):
++                    print(
++                        "wheel finalize: leaving target-driver dependency external: "
++                        f"{path} -> {needed_name}"
++                    )
++                    continue
+                 raise RuntimeError(f"runtime dependency not found for {path}: {needed_name}")
+             dep_path_str = raw_target.split(" ", 1)[0].strip()
+         else:
+diff --git a/setup_and_pack/tests/test_vendor_runtime_layout.py b/setup_and_pack/tests/test_vendor_runtime_layout.py
+index 48f87be..52eac3d 100644
+--- a/setup_and_pack/tests/test_vendor_runtime_layout.py
++++ b/setup_and_pack/tests/test_vendor_runtime_layout.py
+@@ -33,6 +33,15 @@ def _load_module(module_path: Path, module_name: str):
+ 
+ 
+ class VendorRuntimeLayoutTest(unittest.TestCase):
++    def test_cuda_driver_is_external_but_cuda_runtime_is_packaged(self) -> None:
++        for module_path in PACKER_MODULE_PATHS:
++            mod = _load_module(
++                module_path=module_path,
++                module_name=f"vendor_runtime_cuda_external_{module_path.stem}",
++            )
++            self.assertTrue(mod._is_external_driver_runtime_lib("libcuda.so.1"))
++            self.assertFalse(mod._is_external_driver_runtime_lib("libcudart.so.12"))
++
+     def test_ensure_vendor_runtime_soname_aliases_materializes_missing_alias_files(self) -> None:
+         with tempfile.TemporaryDirectory() as tmpdir:
+             root = Path(tmpdir)
