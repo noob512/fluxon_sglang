@@ -1,0 +1,420 @@
+"""
+Facade for the PegaFlow vLLM connector, split into scheduler/worker implementations.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Iterable
+from typing import Any
+
+import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorRole,
+)
+from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
+
+from pegaflow.connector.common import (
+    ConnectorContext,
+    PegaConnectorMetadata,
+    PegaConnectorMode,
+    PegaKVConnectorStats,
+    PegaPromMetrics,
+    derive_namespace,
+    detect_mla,
+    logger,
+    resolve_instance_id,
+    resolve_transfer_backend,
+)
+from pegaflow.connector.scheduler import SchedulerConnector
+from pegaflow.connector.state_manager import ServiceStateManager
+from pegaflow.connector.worker import WorkerConnector
+from pegaflow.pegaflow import EngineRpcClient
+
+
+class PegaKVConnector(KVConnectorBase_V1):
+    """v1 KV connector for PegaFlow with separated scheduler/worker logic."""
+
+    def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
+        super().__init__(vllm_config, role, kv_cache_config)
+
+        instance_id = resolve_instance_id(vllm_config)
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        world_size = vllm_config.parallel_config.world_size
+        is_mla = detect_mla(vllm_config)
+        dcp_world_size = (
+            getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1) or 1
+        )
+        pcp_world_size = (
+            getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) or 1
+        )
+        effective_tp_size = max(1, dcp_world_size) if is_mla else tp_size
+
+        if dcp_world_size > 1 and not is_mla:
+            logger.warning(
+                "[PegaKVConnector] DCP with non-MLA model detected "
+                "(dcp_world_size=%d). effective_tp_rank will use tp_rank only; "
+                "KV data may collide across DCP ranks if workers share "
+                "the same tp_rank.",
+                dcp_world_size,
+            )
+
+        cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        namespace = derive_namespace(
+            vllm_config,
+            effective_tp_size,
+            dcp_world_size,
+            pcp_world_size,
+            cross_layer_blocks=cross_layer_blocks,
+        )
+        block_size = vllm_config.cache_config.block_size
+
+        tp_rank: int | None = None
+        device_id: int | None = None
+        dcp_rank: int = 0
+        pp_rank: int = 0
+        pp_size: int = getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1
+        if role == KVConnectorRole.WORKER:
+            tp_rank = get_tensor_model_parallel_rank()
+            pp_group = get_pp_group()
+            pp_rank = pp_group.rank_in_group
+            if dcp_world_size > 1:
+                from vllm.distributed.parallel_state import (
+                    get_decode_context_model_parallel_rank,
+                )
+
+                dcp_rank = get_decode_context_model_parallel_rank()
+            if torch.cuda.is_available():
+                device_id = _resolve_device_id()
+
+        assert vllm_config.kv_transfer_config is not None
+        server_host = os.environ.get(
+            "PEGAFLOW_HOST"
+        ) or vllm_config.kv_transfer_config.get_from_extra_config(
+            "pegaflow.host", "http://127.0.0.1"
+        )
+        server_port = os.environ.get(
+            "PEGAFLOW_PORT"
+        ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
+        mode = PegaConnectorMode.from_config(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "pegaflow.mode", PegaConnectorMode.READ_WRITE.value
+            )
+        )
+        transfer_backend = resolve_transfer_backend(
+            is_mla,
+            vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.transfer_backend", None),
+        )
+        self._engine_endpoint = f"{server_host}:{server_port}"
+        engine_client = EngineRpcClient(self._engine_endpoint)
+        logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
+
+        self._state_manager = ServiceStateManager(engine_client)
+
+        self._ctx = ConnectorContext(
+            instance_id=instance_id,
+            namespace=namespace,
+            block_size=block_size,
+            tp_size=tp_size,
+            world_size=world_size,
+            tp_rank=tp_rank,
+            device_id=device_id,
+            engine_client=engine_client,
+            state_manager=self._state_manager,
+            is_mla=is_mla,
+            transfer_backend=transfer_backend,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            dcp_rank=dcp_rank,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            mode=mode,
+        )
+
+        # MLA attention backends expose no num-layers stride dimension, so vLLM
+        # cannot build a cross-layer (uniform) KV cache for MLA. Requesting it
+        # is silently ignored upstream and falls back to per-layer — surface
+        # that instead of pretending the request was honored.
+        env_cross_layer = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        self._prefer_cross_layer = env_cross_layer and not is_mla
+        if is_mla and env_cross_layer:
+            logger.warning(
+                "[PegaKVConnector] PEGAFLOW_CROSS_LAYER_BLOCKS=1 is ignored for MLA "
+                "models: cross-layer KV cache is unsupported by MLA attention backends; "
+                "using per-layer registration."
+            )
+
+        self._scheduler: SchedulerConnector | None = None
+        self._worker: WorkerConnector | None = None
+        if role == KVConnectorRole.SCHEDULER:
+            pd_tail_save = bool(
+                vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_save", False)
+            )
+            self._scheduler = SchedulerConnector(
+                self._ctx, pd_tail_save=pd_tail_save, vllm_config=vllm_config
+            )
+            # Open the liveness stream from the scheduler process only. One
+            # stream per vllm replica is enough — if any tp worker crashes,
+            # the scheduler dies too, closing this stream and triggering
+            # server-side cleanup of the instance's CUDA IPC mappings.
+            engine_client.start_session_watcher(instance_id, namespace, tp_size, world_size)
+        else:
+            self._worker = WorkerConnector(
+                self._ctx,
+                vllm_config=vllm_config,
+                kv_cache_config=kv_cache_config,
+            )
+
+        logger.debug(
+            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
+            "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d namespace=%s "
+            "is_mla=%s transfer_backend=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d mode=%s",
+            role.name,
+            instance_id,
+            device_id if device_id is not None else "cpu",
+            tp_rank if tp_rank is not None else "N/A",
+            tp_size,
+            pp_rank,
+            pp_size,
+            world_size,
+            namespace,
+            is_mla,
+            transfer_backend,
+            dcp_world_size,
+            pcp_world_size,
+            dcp_rank,
+            mode.value,
+        )
+
+    # ==============================
+    # Worker-side methods
+    # ==============================
+    def start_load_kv(self, forward_context, **kwargs: Any) -> None:
+        if not self._worker:
+            return
+        metadata = self._get_connector_metadata()
+        if metadata is None:
+            return
+        self._worker.start_load_kv(metadata, forward_context, **kwargs)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if not self._worker:
+            return
+        self._worker.wait_for_layer_load(layer_name)
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata,
+        **kwargs: Any,
+    ) -> None:
+        # Save is submitted from wait_for_save() using scheduler metadata.
+        # Layer callbacks are intentionally ignored so CUDA graph replay
+        # cannot suppress save submission.
+        pass
+
+    def wait_for_save(self) -> None:
+        if not self._worker:
+            return
+        self._worker.wait_for_save()
+
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        if not self._worker:
+            return (None, None)
+        return self._worker.get_finished(finished_req_ids)
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        if not self._worker:
+            return
+        self._worker.register_kv_caches(kv_caches)
+
+    def unregister_context(self) -> None:
+        if self._worker:
+            self._worker.unregister_context()
+
+    def handle_preemptions(self, preempted) -> None:
+        if not self._worker:
+            return
+        # Compat: old vLLM passes set[str], new vLLM passes KVConnectorMetadata
+        if isinstance(preempted, set):
+            preempted_req_ids = preempted
+        else:
+            preempted_req_ids = getattr(preempted, "preempted_req_ids", None) or set()
+        self._worker.handle_preemptions(preempted_req_ids)
+
+    # ==============================
+    # Scheduler-side methods
+    # ==============================
+    def update_connector_output(self, connector_output) -> None:
+        if self._scheduler:
+            self._scheduler.update_connector_output(connector_output)
+
+    def request_finished(
+        self,
+        request,
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if self._scheduler:
+            return self._scheduler.request_finished(request, block_ids)
+        return (False, None)
+
+    def take_events(self) -> Iterable:
+        return ()
+
+    def get_num_new_matched_tokens(
+        self,
+        request,
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        if not self._scheduler:
+            return (0, False)
+        return self._scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def update_state_after_alloc(
+        self,
+        request,
+        blocks,
+        num_external_tokens: int,
+    ) -> None:
+        if self._scheduler:
+            self._scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def build_connector_meta(self, scheduler_output) -> PegaConnectorMetadata:
+        if not self._scheduler:
+            return PegaConnectorMetadata()
+        return self._scheduler.build_connector_meta(scheduler_output)
+
+    # ==============================
+    # Defaults and shutdown
+    # ==============================
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if not self._worker:
+            return set()
+        return self._worker.get_block_ids_with_load_errors()
+
+    def get_kv_connector_stats(self) -> PegaKVConnectorStats | None:
+        stats: PegaKVConnectorStats | None = None
+
+        # Collect scheduler-side stats
+        if self._scheduler:
+            stats = self._scheduler.get_stats()
+
+        # Collect worker-side stats
+        if self._worker:
+            worker_stats = self._worker.get_stats()
+            if worker_stats is not None:
+                stats = worker_stats if stats is None else stats.aggregate(worker_stats)
+
+        return stats
+
+    @classmethod
+    def build_kv_connector_stats(cls, data: dict | None = None) -> PegaKVConnectorStats | None:
+        if data is None:
+            return None
+        return PegaKVConnectorStats(data=data)
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config,
+        metric_types,
+        labelnames,
+        per_engine_labelvalues,
+    ) -> PegaPromMetrics:
+        return PegaPromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+
+    def get_handshake_metadata(self):
+        return None
+
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        return self._prefer_cross_layer
+
+    def register_cross_layers_kv_cache(self, kv_cache, attn_backend):
+        if not self._worker:
+            return
+        self._worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
+
+    def set_host_xfer_buffer_ops(self, copy_operation):
+        return
+
+    def get_finished_count(self) -> int | None:
+        return None
+
+    def shutdown(self):
+        if self._scheduler:
+            self._scheduler.shutdown()
+        if self._worker:
+            self._worker.shutdown()
+        if self._state_manager:
+            self._state_manager.shutdown()
+
+
+class NoopKVConnector(KVConnectorBase_V1):
+    """Connector-path baseline for tests."""
+
+    def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
+        super().__init__(vllm_config, role, kv_cache_config)
+        self._is_mla = detect_mla(vllm_config)
+
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        # MLA cannot use cross-layer KV (no num-layers stride); be honest.
+        return not self._is_mla and os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+
+    def start_load_kv(self, forward_context, **kwargs: Any) -> None:
+        return
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        return
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata,
+        **kwargs: Any,
+    ) -> None:
+        return
+
+    def wait_for_save(self) -> None:
+        return
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens: int):
+        return (0, False)
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens: int) -> None:
+        return
+
+    def build_connector_meta(self, scheduler_output) -> PegaConnectorMetadata:
+        return PegaConnectorMetadata()
+
+
+def _resolve_device_id() -> int:
+    """
+    Return the global CUDA device id even when CUDA_VISIBLE_DEVICES masks GPUs.
+
+    torch.cuda.current_device() returns the local index within the visible set,
+    but we need the actual global device ID for operations like CUDA IPC.
+    This function maps the local index back to the global device ID.
+    """
+    local_id = torch.cuda.current_device()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return local_id
+
+    slots = [slot.strip() for slot in visible.split(",") if slot.strip()]
+    try:
+        mapped = slots[local_id]
+    except IndexError:
+        return local_id
+
+    try:
+        return int(mapped)
+    except ValueError:
+        return local_id
+
+
+__all__ = ["PegaKVConnector", "NoopKVConnector", "KVConnectorRole"]

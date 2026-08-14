@@ -1,0 +1,55 @@
+[package]
+name = "pegaflow-server"
+version.workspace = true
+edition.workspace = true
+default-run = "pegaflow-server"
+
+[lints]
+workspace = true
+
+[features]
+default = ["cuda-12", "rdma"]
+cuda-12 = ["pegaflow-core/cuda-12"]
+cuda-13 = ["pegaflow-core/cuda-13"]
+rdma = ["pegaflow-core/rdma"]
+tracing = ["fastrace", "pegaflow-core/tracing"]
+
+[lib]
+name = "pegaflow_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pegaflow-server"
+path = "src/main.rs"
+
+[dependencies]
+pegaflow-common.workspace = true
+pegaflow-core = { workspace = true, default-features = false }
+pegaflow-proto = { path = "../pegaflow-proto" }
+pyo3 = { workspace = true, features = ["auto-initialize"] }
+cudarc.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+clap.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-stream.workspace = true
+uuid.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-prometheus.workspace = true
+prometheus.workspace = true
+tikv-jemallocator.workspace = true
+fastrace = { workspace = true, features = ["enable"], optional = true }
+
+[dev-dependencies]
+pegaflow-metaserver = { path = "../pegaflow-metaserver", default-features = false }
+
+[build-dependencies]
+pyo3-build-config.workspace = true

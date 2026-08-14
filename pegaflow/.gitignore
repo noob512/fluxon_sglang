@@ -1,0 +1,29 @@
+# Rust
+/target
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+examples/bench_results/
+examples/pd_logs/
+python/tests/*.log
+
+# Built binaries in Python package (generated during wheel build)
+python/pegaflow/pegaflow-server
+python/pegaflow/pegaflow-server-py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude
+CLAUDE.local.md

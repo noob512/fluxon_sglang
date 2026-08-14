@@ -1,0 +1,38 @@
+[package]
+name = "pegaflow-metaserver"
+version.workspace = true
+edition.workspace = true
+default-run = "pegaflow-metaserver"
+
+[lints]
+workspace = true
+
+[lib]
+name = "pegaflow_metaserver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pegaflow-metaserver"
+path = "src/main.rs"
+
+[dependencies]
+pegaflow-common.workspace = true
+pegaflow-proto = { path = "../pegaflow-proto" }
+tonic.workspace = true
+tokio.workspace = true
+clap.workspace = true
+log.workspace = true
+dashmap.workspace = true
+uuid.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-prometheus.workspace = true
+prometheus.workspace = true
+axum.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "unregister_node"
+harness = false

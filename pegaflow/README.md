@@ -1,0 +1,106 @@
+# Pegaflow
+
+<div align="center">
+  <img src="./assets/logo.png" width="200" />
+  <p><strong><em>KV cache on the wings of Pegasus.</em></strong></p>
+
+  [![CI](https://github.com/novitalabs/pegaflow/actions/workflows/ci.yml/badge.svg)](https://github.com/novitalabs/pegaflow/actions/workflows/ci.yml)
+  [![PyPI](https://img.shields.io/pypi/v/pegaflow-llm)](https://pypi.org/project/pegaflow-llm/)
+  [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+</div>
+
+**PegaFlow is a high-performance KV cache storage engine for LLM inference.** Offload KV cache from GPU to host memory or SSD, and share it across nodes via RDMA.
+
+- **Decoupled from inference lifecycle** — runs as an independent sidecar; KV cache survives engine restarts, scales independently, and is shared across instances
+- **Topology-aware, PCIe-saturating transfers** — NUMA-aware pinned memory + layer-wise DMA to maximize hardware bandwidth
+- **GIL-free Rust core** — zero Python overhead on the hot path; your inference engine keeps its threads
+- **Production-ready observability** — built-in Prometheus metrics and OTLP export, not an afterthought
+- **Pluggable** — works with vLLM as a drop-in KV connector
+
+## News
+
+- **2026-05-18** — [vLLM x Novita AI: PegaFlow for Production-Grade External KV Cache](https://vllm.ai/blog/2026-05-18-pegaflow), a joint blog post with the vLLM team.
+
+## Architecture
+
+<div align="center">
+  <img src="./assets/arch.svg" alt="PegaFlow architecture" />
+</div>
+
+## Framework Integration
+
+| Framework | Status | Link |
+|-----------|--------|------|
+| vLLM | ✅ Ready | [Quick Start](#3-launch-your-inference-engine) |
+
+## Quick Start
+
+### 1. Install
+
+```bash
+uv pip install pegaflow-llm        # CUDA 12
+uv pip install pegaflow-llm-cu13   # CUDA 13
+```
+
+### 2. Start PegaFlow Server
+
+```bash
+pegaflow-server
+```
+
+### 3. Launch your inference engine
+
+**vLLM:**
+
+```bash
+vllm serve Qwen/Qwen3-0.6B \
+  --kv-transfer-config '{"kv_connector": "PegaKVConnector", "kv_role": "kv_both", "kv_connector_module_path": "pegaflow.connector"}'
+```
+
+> For full server options, multi-node setup, and advanced configuration, see [Server Configuration](./docs/server.md).
+
+## Development
+
+### Build from source
+
+```bash
+export PYO3_PYTHON=$(which python)
+export LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
+
+cargo run -r                    # start server
+cd python && maturin develop -r # build Python bindings
+```
+
+The default source build targets CUDA 12.8. If your environment uses CUDA 13,
+disable the default CUDA feature and enable `cuda-13` explicitly:
+
+```bash
+cargo run -r --no-default-features --features cuda-13 --bin pegaflow-server
+cd python && uv run maturin develop -r --no-default-features --features cuda-13
+./scripts/build-wheel.sh --release --no-default-features --features cuda-13
+```
+
+We use [Conventional Commits](https://www.conventionalcommits.org/) — run `cz c` for an interactive commit prompt.
+
+## Benchmarks
+
+### KV Cache Benchmark
+
+H800 reference numbers with Llama-3.1-8B (8 prompts, 10K-token prefill, 1-token decode, 4.0 req/s):
+
+| Configuration   | TTFT mean (ms) | TTFT p99 (ms) |
+| --------------- | -------------- | ------------- |
+| PegaFlow (Cold) | 572.5          | 1113.7        |
+| PegaFlow (Warm) | 61.5           | 77.0          |
+
+The warm-start path achieves **~9x faster TTFT** compared to cold-start, demonstrating effective KV cache sharing across requests.
+
+## Documentation
+
+- [Server Configuration](./docs/server.md) — full CLI options, SSD cache, multi-node setup
+- [Python Package](./python/README.md) — Python bindings and vLLM connector configuration
+- [P2P KV Cache Sharing](./docs/p2p.md) — cross-node RDMA setup, tuning, and troubleshooting
+- [P/D Router](./docs/pd.md) — prefill/decode disaggregation
+- [vLLM I/O Patch](./docs/vllm-patch.md) — optional patch for better transfer throughput
+- [Metrics](./docs/metrics.md) — Prometheus and OTLP metrics reference
+- [Goals & Non-Goals](./docs/goals.md) — project scope and design philosophy

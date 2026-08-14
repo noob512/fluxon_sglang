@@ -1,0 +1,41 @@
+[package]
+name = "pegaflow-py"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "pegaflow"
+crate-type = ["cdylib"]
+
+# Binary for pegaflow-server (will be included in wheel by maturin)
+[[bin]]
+name = "pegaflow-server-py"
+path = "src/bin/server.rs"
+
+# Binary for pegaflow-metaserver (will be included in wheel by maturin)
+[[bin]]
+name = "pegaflow-metaserver-py"
+path = "src/bin/metaserver.rs"
+
+[features]
+default = ["cuda-12", "rdma"]
+cuda-12 = ["pegaflow-core/cuda-12", "pegaflow-server/cuda-12", "pegaflow-transfer?/cuda-12"]
+cuda-13 = ["pegaflow-core/cuda-13", "pegaflow-server/cuda-13", "pegaflow-transfer?/cuda-13"]
+rdma = ["dep:pegaflow-transfer", "dep:pegaflow-pd-wire", "pegaflow-core/rdma", "pegaflow-server/rdma"]
+
+[dependencies]
+pyo3 = { workspace = true, features = ["extension-module"] }
+pegaflow-common.workspace = true
+pegaflow-core = { workspace = true, default-features = false }
+pegaflow-proto = { path = "../pegaflow-proto" }
+pegaflow-server = { path = "../pegaflow-server", default-features = false }
+pegaflow-metaserver = { path = "../pegaflow-metaserver", default-features = false }
+pegaflow-pd-wire = { workspace = true, optional = true }
+pegaflow-transfer = { workspace = true, optional = true }
+tokio.workspace = true
+tonic.workspace = true
+log.workspace = true
+mea.workspace = true
