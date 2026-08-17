@@ -1,17 +1,18 @@
 pub mod msg_pack;
 pub mod one_seg_allocator;
-use self::msg_pack::RequestSegmentRegistrationReq;
+use self::msg_pack::{OwnerCapacityReport, OwnerCapacityReportReq, OwnerCapacityReportResp};
+use self::msg_pack::{OwnerPlacementClass, RequestSegmentRegistrationReq};
 use self::msg_pack::{SegmentAllocationAuthority, SegmentDeviceDescription, SegmentDeviceMemInfo};
 use self::one_seg_allocator::{
     Allocation, NodePoolCapacityBudget, NodePoolCapacitySnapshot, OneSegAllocator,
 };
 use crate::cluster_manager::NodeID;
-use crate::p2p::control_plane_rpc::call_control_plane_rpc;
+use crate::p2p::control_plane_rpc::{call_control_plane_rpc, send_control_plane_rpc_response};
 use crate::p2p::p2p_module::P2pModuleAccessTrait;
 use crate::rpcresp_kvresult_convert::msg_and_error::OK;
 use crate::{
     p2p::{
-        msg_pack::{MsgPack, RPCCaller},
+        msg_pack::{MsgPack, RPCCaller, RPCHandler},
         p2p_module::P2pModule,
     },
     rpcresp_kvresult_convert::msg_and_error::{KvError, KvResult},
@@ -20,14 +21,15 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use fluxon_framework::{LogicalModule, define_module};
 use msg_pack::SegmentDeviceID;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn build_node_segments_manager(
     node_start_time: i64,
     allocation_authority: SegmentAllocationAuthority,
+    owner_placement_class: OwnerPlacementClass,
     owner_local_target_bytes: Option<u64>,
     seg_map: std::collections::HashMap<
         SegmentDeviceID,
@@ -63,26 +65,31 @@ fn build_node_segments_manager(
         })
     })?;
     let capacity_budget = Arc::new(NodePoolCapacityBudget::new(total_size)?);
-    match (allocation_authority, owner_local_target_bytes) {
-        (SegmentAllocationAuthority::Owner, Some(target))
-            if target != 0 && target <= total_size => {}
-        (SegmentAllocationAuthority::Owner, target) => {
+    match (
+        allocation_authority,
+        owner_placement_class,
+        owner_local_target_bytes,
+    ) {
+        (SegmentAllocationAuthority::Owner, OwnerPlacementClass::Inference, Some(target))
+            if target != 0 && target < total_size => {}
+        (SegmentAllocationAuthority::Owner, OwnerPlacementClass::RemoteCpu, Some(0)) => {}
+        (SegmentAllocationAuthority::Owner, placement_class, target) => {
             return Err(KvError::Api(
                 crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
                     detail: format!(
-                        "owner-authoritative segment requires local target in [1, {}], got {:?}",
-                        total_size, target
+                        "owner-authoritative segment has invalid placement class/local target: class={:?} target={:?} physical={}",
+                        placement_class, target, total_size
                     ),
                 },
             ));
         }
-        (SegmentAllocationAuthority::Master, None) => {}
-        (SegmentAllocationAuthority::Master, Some(target)) => {
+        (SegmentAllocationAuthority::Master, OwnerPlacementClass::Invalid, None) => {}
+        (SegmentAllocationAuthority::Master, placement_class, target) => {
             return Err(KvError::Api(
                 crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
                     detail: format!(
-                        "master-authoritative segment must not report owner local target: {}",
-                        target
+                        "master-authoritative segment must not report owner placement state: class={:?} target={:?}",
+                        placement_class, target
                     ),
                 },
             ));
@@ -109,6 +116,7 @@ fn build_node_segments_manager(
         node_start_time,
         total_size,
         allocation_authority,
+        owner_placement_class,
         owner_local_target_bytes,
         seg_map,
         device_id_2_allocator,
@@ -121,6 +129,7 @@ fn validate_live_registration_identity(
     existing: &NodeSegmentsManager,
     requested_node_start_time: i64,
     requested_authority: SegmentAllocationAuthority,
+    requested_placement_class: OwnerPlacementClass,
     requested_local_target_bytes: Option<u64>,
 ) -> KvResult<()> {
     if existing.node_start_time != requested_node_start_time {
@@ -139,6 +148,16 @@ fn validate_live_registration_identity(
                 detail: format!(
                     "segment allocation authority changed within one live generation: node={} live={:?} requested={:?}",
                     node_id, existing.allocation_authority, requested_authority
+                ),
+            },
+        ));
+    }
+    if existing.owner_placement_class != requested_placement_class {
+        return Err(KvError::Api(
+            crate::rpcresp_kvresult_convert::msg_and_error::ApiError::RegisterSegmentFailed {
+                detail: format!(
+                    "owner placement class changed within one live generation: node={} live={:?} requested={:?}",
+                    node_id, existing.owner_placement_class, requested_placement_class
                 ),
             },
         ));
@@ -163,6 +182,7 @@ fn register_node_segments(
     node_id: NodeID,
     node_start_time: i64,
     allocation_authority: SegmentAllocationAuthority,
+    owner_placement_class: OwnerPlacementClass,
     owner_local_target_bytes: Option<u64>,
     seg_map: std::collections::HashMap<
         SegmentDeviceID,
@@ -192,6 +212,7 @@ fn register_node_segments(
             v.insert(build_node_segments_manager(
                 node_start_time,
                 allocation_authority,
+                owner_placement_class,
                 owner_local_target_bytes,
                 seg_map,
             )?);
@@ -216,6 +237,7 @@ fn register_node_segments(
                 *node_segments_manager = build_node_segments_manager(
                     node_start_time,
                     allocation_authority,
+                    owner_placement_class,
                     owner_local_target_bytes,
                     seg_map,
                 )?;
@@ -228,6 +250,7 @@ fn register_node_segments(
                 node_segments_manager,
                 node_start_time,
                 allocation_authority,
+                owner_placement_class,
                 owner_local_target_bytes,
             )?;
 
@@ -356,11 +379,18 @@ pub struct NodeSegmentsManager {
     node_start_time: i64,
     total_size: u64,
     allocation_authority: SegmentAllocationAuthority,
+    owner_placement_class: OwnerPlacementClass,
     owner_local_target_bytes: Option<u64>,
     registered_segments: HashMap<SegmentDeviceID, (SegmentDeviceDescription, SegmentDeviceMemInfo)>,
     device_id_2_allocator: HashMap<SegmentDeviceID, Arc<OneSegAllocator>>,
     capacity_budget: Arc<NodePoolCapacityBudget>,
+    owner_capacity_report: Option<StoredOwnerCapacityReport>,
     tomb_tag: NodeTombTag,
+}
+
+struct StoredOwnerCapacityReport {
+    report: OwnerCapacityReport,
+    received_at: Instant,
 }
 
 impl NodeSegmentsManager {
@@ -368,6 +398,7 @@ impl NodeSegmentsManager {
         node_start_time: i64,
         total_size: u64,
         allocation_authority: SegmentAllocationAuthority,
+        owner_placement_class: OwnerPlacementClass,
         owner_local_target_bytes: Option<u64>,
         registered_segments: HashMap<
             SegmentDeviceID,
@@ -380,10 +411,12 @@ impl NodeSegmentsManager {
             node_start_time,
             total_size,
             allocation_authority,
+            owner_placement_class,
             owner_local_target_bytes,
             registered_segments,
             device_id_2_allocator,
             capacity_budget,
+            owner_capacity_report: None,
             tomb_tag: NodeTombTag::new(),
         }
     }
@@ -394,6 +427,11 @@ pub struct MasterSegManagerInner {
     /// { node_id -> { seg_name -> allocator } }
     /// nodes memory distribution will not change in current design
     node_allocators_and_tomb_tag: DashMap<NodeID, NodeSegmentsManager>,
+
+    /// Allocation size classes observed in valid owner reports or requested
+    /// by placement. Owners learn this set through the existing report
+    /// response and publish exact allocator-derived capacity on the next tick.
+    owner_capacity_size_classes: parking_lot::RwLock<BTreeSet<u64>>,
 
     /// RPC caller for requesting segment registration from clients
     rpc_caller_request_segment_registration: RPCCaller<RequestSegmentRegistrationReq>,
@@ -447,6 +485,7 @@ impl MasterSegManager {
         let inner = MasterSegManagerInner {
             view: std::sync::OnceLock::new(),
             node_allocators_and_tomb_tag: DashMap::new(),
+            owner_capacity_size_classes: parking_lot::RwLock::new(BTreeSet::new()),
             rpc_caller_request_segment_registration: RPCCaller::new(),
         };
         Ok(Self(inner))
@@ -580,8 +619,48 @@ impl MasterSegManager {
     }
 
     fn register_rpc_handlers(&self) {
-        // QuerySegBase RPC removed: no handlers to register here currently.
-        let _ = self;
+        let view = self.0.view().clone();
+        RPCHandler::<OwnerCapacityReportReq>::new().regist(
+            self.0.view().p2p_module(),
+            move |resp, msg| {
+                let caller = resp.node_id().clone();
+                let spawn_view = view.clone();
+                let worker_view = spawn_view.clone();
+                spawn_view.spawn("rpc_owner_capacity_report", async move {
+                    let result = worker_view
+                        .master_seg_manager()
+                        .update_owner_capacity_report(&caller, msg.serialize_part.report);
+                    let response = match result {
+                        Ok(accepted_report_epoch) => OwnerCapacityReportResp {
+                            accepted_report_epoch,
+                            requested_size_classes: worker_view
+                                .master_seg_manager()
+                                .owner_capacity_size_classes(),
+                            error_code: OK,
+                            error_json: String::new(),
+                        },
+                        Err(error) => OwnerCapacityReportResp {
+                            accepted_report_epoch: 0,
+                            requested_size_classes: Vec::new(),
+                            error_code: error.code(),
+                            error_json: error.to_json(),
+                        },
+                    };
+                    if let Err(error) = send_control_plane_rpc_response(
+                        &resp,
+                        MsgPack {
+                            serialize_part: response,
+                            raw_bytes: Vec::new(),
+                        },
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, caller = %caller, "failed to send owner capacity report response");
+                    }
+                });
+                Ok(())
+            },
+        );
     }
 
     /// Request segment registration from a client node
@@ -649,6 +728,7 @@ impl MasterSegManager {
             node_id.clone(),
             expected_node_start_time,
             resp.serialize_part.allocation_authority,
+            resp.serialize_part.owner_placement_class,
             resp.serialize_part.owner_local_target_bytes,
             resp.serialize_part.seg_map,
         ) {
@@ -682,6 +762,198 @@ impl MasterSegManager {
             .get(node_id)
             .filter(|node| !node.tomb_tag.is_tomb())
             .map(|node| node.allocation_authority)
+    }
+
+    pub fn get_owner_placement_class(&self, node_id: &str) -> Option<OwnerPlacementClass> {
+        self.inner()
+            .node_allocators_and_tomb_tag
+            .get(node_id)
+            .filter(|node| !node.tomb_tag.is_tomb())
+            .map(|node| node.owner_placement_class)
+    }
+
+    pub fn update_owner_capacity_report(
+        &self,
+        node_id: &NodeID,
+        report: OwnerCapacityReport,
+    ) -> KvResult<u64> {
+        let invalid = |detail: String| {
+            KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
+                    detail,
+                },
+            )
+        };
+        let mut node = self
+            .inner()
+            .node_allocators_and_tomb_tag
+            .get_mut(node_id)
+            .ok_or_else(|| {
+                KvError::Api(
+                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::NodeNotFound {
+                        desc: node_id.to_string(),
+                    },
+                )
+            })?;
+        if node.tomb_tag.is_tomb() || node.allocation_authority != SegmentAllocationAuthority::Owner
+        {
+            return Err(invalid(format!(
+                "capacity report requires a live owner-authoritative node: node={}",
+                node_id
+            )));
+        }
+        if report.owner_node_start_time != node.node_start_time {
+            return Err(KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::OwnerStartTimeMismatch {
+                    expected: node.node_start_time,
+                    got: report.owner_node_start_time,
+                },
+            ));
+        }
+        if !report.placement_class.is_valid()
+            || report.placement_class != node.owner_placement_class
+        {
+            return Err(invalid(format!(
+                "capacity report placement class mismatch: node={} registered={:?} reported={:?}",
+                node_id, node.owner_placement_class, report.placement_class
+            )));
+        }
+        let placement_shape_valid = match report.placement_class {
+            OwnerPlacementClass::Inference => {
+                report.local_target_bytes != 0
+                    && report.local_target_bytes < report.physical_capacity_bytes
+            }
+            OwnerPlacementClass::RemoteCpu => {
+                report.local_target_bytes == 0 && report.controller_epoch == 1
+            }
+            OwnerPlacementClass::Invalid => false,
+        };
+        let allocated_plus_free = report.allocated_bytes.checked_add(report.raw_free_bytes);
+        if report.report_epoch == 0
+            || report.controller_epoch == 0
+            || report.physical_capacity_bytes != node.total_size
+            || report.global_target_bytes
+                != report
+                    .physical_capacity_bytes
+                    .saturating_sub(report.local_target_bytes)
+            || allocated_plus_free != Some(report.physical_capacity_bytes)
+            || report.largest_free_bytes > report.raw_free_bytes
+            || report.global_accounted_bytes > report.allocated_bytes
+            || !placement_shape_valid
+            || (report.controller_epoch == 1
+                && node.owner_local_target_bytes != Some(report.local_target_bytes))
+            || (report.settled
+                && (report.global_accounted_bytes > report.global_target_bytes
+                    || report.local_weighted_bytes > report.local_target_bytes))
+        {
+            return Err(invalid(format!(
+                "invalid owner capacity accounting: node={} report={:?}",
+                node_id, report
+            )));
+        }
+        let mut previous_size = 0u64;
+        for size_class in &report.size_classes {
+            if size_class.allocation_size_bytes == 0
+                || size_class.allocation_size_bytes
+                    % crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES
+                    != 0
+                || size_class.allocation_size_bytes <= previous_size
+                || size_class.allocatable_bytes > report.raw_free_bytes
+                || size_class.allocatable_bytes % size_class.allocation_size_bytes != 0
+            {
+                return Err(invalid(format!(
+                    "invalid owner capacity size class: node={} previous={} class={:?}",
+                    node_id, previous_size, size_class
+                )));
+            }
+            previous_size = size_class.allocation_size_bytes;
+        }
+
+        if let Some(existing) = node.owner_capacity_report.as_ref() {
+            if report.report_epoch < existing.report.report_epoch {
+                return Err(invalid(format!(
+                    "stale owner capacity report: node={} current={} reported={}",
+                    node_id, existing.report.report_epoch, report.report_epoch
+                )));
+            }
+            if report.report_epoch == existing.report.report_epoch && report != existing.report {
+                return Err(invalid(format!(
+                    "owner capacity report epoch replay changed payload: node={} epoch={}",
+                    node_id, report.report_epoch
+                )));
+            }
+            if report.controller_epoch < existing.report.controller_epoch
+                || report.controller_epoch > existing.report.controller_epoch.saturating_add(1)
+                || (report.controller_epoch == existing.report.controller_epoch
+                    && report.local_target_bytes != existing.report.local_target_bytes)
+                || (report.placement_class == OwnerPlacementClass::RemoteCpu
+                    && report.controller_epoch != existing.report.controller_epoch)
+            {
+                return Err(invalid(format!(
+                    "owner capacity controller epoch/target transition is invalid: node={} current_epoch={} reported_epoch={} current_local_target={} reported_local_target={}",
+                    node_id,
+                    existing.report.controller_epoch,
+                    report.controller_epoch,
+                    existing.report.local_target_bytes,
+                    report.local_target_bytes
+                )));
+            }
+            if report.report_epoch == existing.report.report_epoch {
+                // An identical retry is idempotent, but it does not prove that
+                // the allocator snapshot is fresh. Keep the original receipt
+                // time so a stuck replay cannot indefinitely evade staleness.
+                return Ok(report.report_epoch);
+            }
+        }
+        let accepted_report_epoch = report.report_epoch;
+        let reported_size_classes = report
+            .size_classes
+            .iter()
+            .map(|size_class| size_class.allocation_size_bytes)
+            .collect::<Vec<_>>();
+        node.owner_capacity_report = Some(StoredOwnerCapacityReport {
+            report,
+            received_at: Instant::now(),
+        });
+        drop(node);
+        for allocation_size in reported_size_classes {
+            self.register_owner_capacity_size_class(allocation_size);
+        }
+        Ok(accepted_report_epoch)
+    }
+
+    pub fn register_owner_capacity_size_class(&self, allocation_size: u64) -> bool {
+        if allocation_size == 0
+            || allocation_size % crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES != 0
+        {
+            return false;
+        }
+        self.inner()
+            .owner_capacity_size_classes
+            .write()
+            .insert(allocation_size)
+    }
+
+    pub fn owner_capacity_size_classes(&self) -> Vec<u64> {
+        self.inner()
+            .owner_capacity_size_classes
+            .read()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub fn get_owner_capacity_report(
+        &self,
+        node_id: &str,
+    ) -> Option<(OwnerCapacityReport, Duration)> {
+        let node = self.inner().node_allocators_and_tomb_tag.get(node_id)?;
+        if node.tomb_tag.is_tomb() || node.allocation_authority != SegmentAllocationAuthority::Owner
+        {
+            return None;
+        }
+        let stored = node.owner_capacity_report.as_ref()?;
+        Some((stored.report.clone(), stored.received_at.elapsed()))
     }
 
     pub fn get_owner_local_target_bytes(&self, node_id: &str) -> Option<u64> {
@@ -795,7 +1067,7 @@ impl MasterSegManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::master_seg_manager::msg_pack::SegmentDeviceMemInfo;
+    use crate::master_seg_manager::msg_pack::{OwnerSizeClassCapacity, SegmentDeviceMemInfo};
 
     fn one_cpu_segment(
         bytes: u64,
@@ -812,11 +1084,69 @@ mod tests {
         )])
     }
 
+    fn manager_with_owner(
+        node_id: &str,
+        node_start_time: i64,
+        placement_class: OwnerPlacementClass,
+        local_target_bytes: u64,
+        physical_capacity_bytes: u64,
+    ) -> (MasterSegManager, NodeID) {
+        let manager = MasterSegManager(MasterSegManagerInner {
+            view: std::sync::OnceLock::new(),
+            node_allocators_and_tomb_tag: DashMap::new(),
+            owner_capacity_size_classes: parking_lot::RwLock::new(BTreeSet::new()),
+            rpc_caller_request_segment_registration: RPCCaller::new(),
+        });
+        let node_id: NodeID = node_id.to_string().into();
+        manager.inner().node_allocators_and_tomb_tag.insert(
+            node_id.clone(),
+            build_node_segments_manager(
+                node_start_time,
+                SegmentAllocationAuthority::Owner,
+                placement_class,
+                Some(local_target_bytes),
+                one_cpu_segment(physical_capacity_bytes),
+            )
+            .unwrap(),
+        );
+        (manager, node_id)
+    }
+
+    fn valid_capacity_report(
+        node_start_time: i64,
+        placement_class: OwnerPlacementClass,
+        report_epoch: u64,
+        controller_epoch: u64,
+        physical_capacity_bytes: u64,
+        local_target_bytes: u64,
+    ) -> OwnerCapacityReport {
+        OwnerCapacityReport {
+            owner_node_start_time: node_start_time,
+            placement_class,
+            controller_epoch,
+            report_epoch,
+            physical_capacity_bytes,
+            local_target_bytes,
+            global_target_bytes: physical_capacity_bytes - local_target_bytes,
+            allocated_bytes: 0,
+            raw_free_bytes: physical_capacity_bytes,
+            largest_free_bytes: physical_capacity_bytes,
+            global_accounted_bytes: 0,
+            local_weighted_bytes: 0,
+            settled: true,
+            size_classes: vec![OwnerSizeClassCapacity {
+                allocation_size_bytes: 4 * 1024,
+                allocatable_bytes: physical_capacity_bytes,
+            }],
+        }
+    }
+
     #[test]
     fn one_node_generation_shares_one_budget_across_registered_segments() {
         let manager = build_node_segments_manager(
             17,
             SegmentAllocationAuthority::Master,
+            OwnerPlacementClass::Invalid,
             None,
             HashMap::from([
                 (
@@ -865,6 +1195,7 @@ mod tests {
         let manager = build_node_segments_manager(
             17,
             SegmentAllocationAuthority::Owner,
+            OwnerPlacementClass::Inference,
             Some(12 * 1024),
             one_cpu_segment(16 * 1024),
         )
@@ -884,10 +1215,176 @@ mod tests {
     }
 
     #[test]
+    fn remote_cpu_owner_registers_zero_local_target_without_master_allocator() {
+        let manager = build_node_segments_manager(
+            23,
+            SegmentAllocationAuthority::Owner,
+            OwnerPlacementClass::RemoteCpu,
+            Some(0),
+            one_cpu_segment(32 * 1024),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.owner_placement_class,
+            OwnerPlacementClass::RemoteCpu
+        );
+        assert_eq!(manager.owner_local_target_bytes, Some(0));
+        assert!(manager.device_id_2_allocator.is_empty());
+        assert!(
+            build_node_segments_manager(
+                23,
+                SegmentAllocationAuthority::Owner,
+                OwnerPlacementClass::RemoteCpu,
+                Some(4 * 1024),
+                one_cpu_segment(32 * 1024),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_cpu_capacity_report_is_generation_and_controller_fenced() {
+        let (manager, node_id) = manager_with_owner(
+            "remote-cpu",
+            23,
+            OwnerPlacementClass::RemoteCpu,
+            0,
+            32 * 1024,
+        );
+        let report = valid_capacity_report(23, OwnerPlacementClass::RemoteCpu, 1, 1, 32 * 1024, 0);
+        assert_eq!(
+            manager
+                .update_owner_capacity_report(&node_id, report.clone())
+                .unwrap(),
+            1
+        );
+        let first_received_at = manager
+            .inner()
+            .node_allocators_and_tomb_tag
+            .get(&node_id)
+            .unwrap()
+            .owner_capacity_report
+            .as_ref()
+            .unwrap()
+            .received_at;
+
+        assert_eq!(
+            manager
+                .update_owner_capacity_report(&node_id, report.clone())
+                .unwrap(),
+            1
+        );
+        let replay_received_at = manager
+            .inner()
+            .node_allocators_and_tomb_tag
+            .get(&node_id)
+            .unwrap()
+            .owner_capacity_report
+            .as_ref()
+            .unwrap()
+            .received_at;
+        assert_eq!(first_received_at, replay_received_at);
+
+        let mut changed_controller = report.clone();
+        changed_controller.report_epoch = 2;
+        changed_controller.controller_epoch = 2;
+        assert!(
+            manager
+                .update_owner_capacity_report(&node_id, changed_controller)
+                .is_err()
+        );
+
+        let mut changed_local_target = report;
+        changed_local_target.report_epoch = 2;
+        changed_local_target.local_target_bytes = 4 * 1024;
+        changed_local_target.global_target_bytes = 28 * 1024;
+        assert!(
+            manager
+                .update_owner_capacity_report(&node_id, changed_local_target)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn inference_capacity_target_changes_only_with_next_controller_epoch() {
+        let (manager, node_id) = manager_with_owner(
+            "inference",
+            17,
+            OwnerPlacementClass::Inference,
+            8 * 1024,
+            32 * 1024,
+        );
+        let first = valid_capacity_report(
+            17,
+            OwnerPlacementClass::Inference,
+            1,
+            1,
+            32 * 1024,
+            8 * 1024,
+        );
+        assert_eq!(
+            manager
+                .update_owner_capacity_report(&node_id, first.clone())
+                .unwrap(),
+            1
+        );
+
+        let mut same_controller_changed_target = first.clone();
+        same_controller_changed_target.report_epoch = 2;
+        same_controller_changed_target.local_target_bytes = 12 * 1024;
+        same_controller_changed_target.global_target_bytes = 20 * 1024;
+        assert!(
+            manager
+                .update_owner_capacity_report(&node_id, same_controller_changed_target)
+                .is_err()
+        );
+
+        let mut next_controller = first;
+        next_controller.report_epoch = 2;
+        next_controller.controller_epoch = 2;
+        next_controller.local_target_bytes = 12 * 1024;
+        next_controller.global_target_bytes = 20 * 1024;
+        assert_eq!(
+            manager
+                .update_owner_capacity_report(&node_id, next_controller)
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn capacity_size_class_interest_is_sorted_and_report_driven() {
+        let (manager, node_id) = manager_with_owner(
+            "remote-cpu",
+            23,
+            OwnerPlacementClass::RemoteCpu,
+            0,
+            32 * 1024,
+        );
+        assert!(manager.register_owner_capacity_size_class(8 * 1024));
+        assert!(!manager.register_owner_capacity_size_class(8 * 1024));
+        assert!(!manager.register_owner_capacity_size_class(123));
+
+        let report = valid_capacity_report(23, OwnerPlacementClass::RemoteCpu, 1, 1, 32 * 1024, 0);
+        assert_eq!(
+            manager
+                .update_owner_capacity_report(&node_id, report)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            manager.owner_capacity_size_classes(),
+            vec![4 * 1024, 8 * 1024]
+        );
+    }
+
+    #[test]
     fn owner_registration_target_and_generation_are_replay_safe() {
         let manager = build_node_segments_manager(
             17,
             SegmentAllocationAuthority::Owner,
+            OwnerPlacementClass::Inference,
             Some(12 * 1024),
             one_cpu_segment(16 * 1024),
         )
@@ -900,6 +1397,7 @@ mod tests {
                 &manager,
                 17,
                 SegmentAllocationAuthority::Owner,
+                OwnerPlacementClass::Inference,
                 Some(12 * 1024),
             )
             .is_ok()
@@ -910,6 +1408,7 @@ mod tests {
                 &manager,
                 18,
                 SegmentAllocationAuthority::Owner,
+                OwnerPlacementClass::Inference,
                 Some(12 * 1024),
             )
             .is_err()
@@ -920,6 +1419,7 @@ mod tests {
                 &manager,
                 17,
                 SegmentAllocationAuthority::Master,
+                OwnerPlacementClass::Invalid,
                 None,
             )
             .is_err()
@@ -930,6 +1430,7 @@ mod tests {
                 &manager,
                 17,
                 SegmentAllocationAuthority::Owner,
+                OwnerPlacementClass::Inference,
                 Some(8 * 1024),
             )
             .is_err()
@@ -939,6 +1440,7 @@ mod tests {
             build_node_segments_manager(
                 17,
                 SegmentAllocationAuthority::Owner,
+                OwnerPlacementClass::Inference,
                 None,
                 one_cpu_segment(16 * 1024),
             )
@@ -948,6 +1450,7 @@ mod tests {
             build_node_segments_manager(
                 17,
                 SegmentAllocationAuthority::Master,
+                OwnerPlacementClass::Invalid,
                 Some(8 * 1024),
                 one_cpu_segment(16 * 1024),
             )

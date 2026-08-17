@@ -3,7 +3,9 @@ use crate::client_kv_api::ClientKvApi;
 use crate::client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait};
 use crate::cluster_manager::{ClusterManagerAccessTrait, NodeRole};
 use crate::config::ContributeToClusterPoolSize;
-use crate::master_seg_manager::msg_pack::{SegmentAllocationAuthority, SegmentDeviceMemInfo};
+use crate::master_seg_manager::msg_pack::{
+    OwnerPlacementClass, SegmentAllocationAuthority, SegmentDeviceMemInfo,
+};
 use crate::p2p::control_plane_rpc::send_control_plane_rpc_response;
 use crate::p2p::p2p_module::P2pModule;
 use crate::p2p::p2p_module::P2pModuleAccessTrait;
@@ -46,9 +48,11 @@ define_module!(
 pub struct ClientSegPoolNewArg {
     pub contribute_size: ContributeToClusterPoolSize,
     pub allocation_authority: SegmentAllocationAuthority,
+    pub owner_placement_class: OwnerPlacementClass,
     /// Initial LocalExclusive byte budget reported with owner-authoritative
     /// segment registration. None means the master owns allocation.
     pub owner_local_target_bytes: Option<u64>,
+    pub owner_segment_memfd: bool,
     pub share_mem_path: String,
     pub large_file_paths: crate::config::LargeFilePaths,
     pub cluster_name: String,
@@ -128,12 +132,11 @@ pub const SIDE_TRANSFER_PEERS_DIRNAME: &str = "side_transfer_peers";
 struct TransferRpcRequiredPeerSet {
     members: Vec<ClusterMember>,
     owner_peer_count: usize,
-    master_peer_count: usize,
 }
 
 impl TransferRpcRequiredPeerSet {
     fn has_complete_roles(&self) -> bool {
-        self.owner_peer_count > 0 && self.master_peer_count == 1
+        self.owner_peer_count > 0
     }
 }
 
@@ -143,17 +146,12 @@ fn transfer_rpc_required_peer_set(
 ) -> TransferRpcRequiredPeerSet {
     let mut required = Vec::new();
     let mut owner_peer_count = 0;
-    let mut master_peer_count = 0;
 
     for member in members {
         if member.id == self_member_id {
             continue;
         }
         match member.node_role() {
-            NodeRole::Master => {
-                master_peer_count += 1;
-                required.push(member);
-            }
             NodeRole::Client
                 if member
                     .metadata
@@ -176,7 +174,6 @@ fn transfer_rpc_required_peer_set(
     TransferRpcRequiredPeerSet {
         members: required,
         owner_peer_count,
-        master_peer_count,
     }
 }
 
@@ -201,7 +198,7 @@ mod transfer_rpc_required_peer_tests {
     }
 
     #[test]
-    fn required_set_contains_master_and_segment_owners_only() {
+    fn required_set_contains_segment_owners_but_not_metadata_only_master() {
         let peers = transfer_rpc_required_peer_set(
             "owner-self",
             vec![
@@ -222,19 +219,18 @@ mod transfer_rpc_required_peer_tests {
 
         assert!(peers.has_complete_roles());
         assert_eq!(peers.owner_peer_count, 1);
-        assert_eq!(peers.master_peer_count, 1);
         assert_eq!(
             peers
                 .members
                 .iter()
                 .map(|member| member.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["master", "owner-peer"]
+            vec!["owner-peer"]
         );
     }
 
     #[test]
-    fn required_set_does_not_complete_without_master_or_owner_peer() {
+    fn required_set_needs_an_owner_peer_but_never_waits_for_master_transfer_rpc() {
         let owner_only = transfer_rpc_required_peer_set(
             "owner-self",
             vec![member(
@@ -242,13 +238,98 @@ mod transfer_rpc_required_peer_tests {
                 &[("client", "true"), ("p2p_relay", "true")],
             )],
         );
-        assert!(!owner_only.has_complete_roles());
+        assert!(owner_only.has_complete_roles());
 
         let master_only = transfer_rpc_required_peer_set(
             "owner-self",
             vec![member("master", &[("master", "true")])],
         );
         assert!(!master_only.has_complete_roles());
+        assert!(master_only.members.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod owner_segment_memfd_tests {
+    use super::{ClientSegPool, ClientSegPoolNewArg};
+    use crate::config::{ContributeToClusterPoolSize, LargeFilePaths};
+    use crate::master_seg_manager::msg_pack::{OwnerPlacementClass, SegmentAllocationAuthority};
+    use std::collections::HashMap;
+    use std::os::fd::AsRawFd;
+    use uuid::Uuid;
+
+    #[::tokio::test]
+    async fn memfd_segment_is_reopenable_through_published_procfs_symlink() {
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .expect("CARGO_TARGET_DIR must point at the NVMe build root");
+        let root = std::path::Path::new(&target_dir)
+            .join("fluxon_kv_tests")
+            .join(format!("owner_memfd_{}", Uuid::new_v4()));
+        let segment_len = 16 * 1024 * 1024u64;
+        let pool = ClientSegPool::construct(ClientSegPoolNewArg {
+            contribute_size: ContributeToClusterPoolSize {
+                dram: segment_len,
+                vram: HashMap::new(),
+            },
+            allocation_authority: SegmentAllocationAuthority::Owner,
+            owner_placement_class: OwnerPlacementClass::Inference,
+            owner_local_target_bytes: Some(segment_len / 2),
+            owner_segment_memfd: true,
+            share_mem_path: root.to_string_lossy().into_owned(),
+            large_file_paths: LargeFilePaths { paths: Vec::new() },
+            cluster_name: "memfd-test".to_string(),
+            etcd_addresses: vec!["127.0.0.1:2379".to_string()],
+            attach_existing_meta: None,
+            side_transfer_worker: false,
+            require_transfer_rpc_fast_path_ready_timeout: None,
+        })
+        .await
+        .unwrap();
+
+        let path = root.join("mmap.file");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let target = std::fs::read_link(&path).unwrap();
+        assert!(
+            target
+                .to_string_lossy()
+                .starts_with(&format!("/proc/{}/fd/", std::process::id()))
+        );
+        let reopened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.metadata().unwrap().len(), segment_len);
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                segment_len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                reopened.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+        unsafe {
+            *(mapped as *mut u8) = 0x5a;
+        }
+        let guard = pool.0.cpu_allocated_mem.read().await;
+        assert_eq!(
+            unsafe { *(guard.as_ref().unwrap().allocated_addr as *const u8) },
+            0x5a
+        );
+        drop(guard);
+        unsafe {
+            libc::munmap(mapped, segment_len as usize);
+        }
+        drop(pool);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -339,6 +420,7 @@ pub struct ClientSegPoolInner {
     side_transfer_worker: bool,
     attach_owner_ref: Option<ShareGroupOwnerRef>,
     allocation_authority: SegmentAllocationAuthority,
+    owner_placement_class: OwnerPlacementClass,
     owner_local_target_bytes: Option<u64>,
 
     // Redundant fields written to shared.json for external bootstrap and strict validation.
@@ -393,7 +475,9 @@ impl ClientSegPool {
 
         let contribute_size = arg.contribute_size;
         let allocation_authority = arg.allocation_authority;
+        let owner_placement_class = arg.owner_placement_class;
         let owner_local_target_bytes = arg.owner_local_target_bytes;
+        let owner_segment_memfd = arg.owner_segment_memfd;
         let share_mem_path = arg.share_mem_path;
         let large_file_paths = arg.large_file_paths;
         let cluster_name = arg.cluster_name;
@@ -493,6 +577,7 @@ impl ClientSegPool {
                 side_transfer_worker,
                 attach_owner_ref,
                 allocation_authority,
+                owner_placement_class,
                 owner_local_target_bytes,
                 cluster_name: cluster_name.clone(),
                 etcd_addresses: etcd_addresses.clone(),
@@ -511,6 +596,7 @@ impl ClientSegPool {
                 side_transfer_worker,
                 attach_owner_ref,
                 allocation_authority,
+                owner_placement_class,
                 owner_local_target_bytes,
                 cluster_name: cluster_name.clone(),
                 etcd_addresses: etcd_addresses.clone(),
@@ -555,7 +641,7 @@ impl ClientSegPool {
         })?;
 
         let mmap_file_path = Path::new(base_path).join("mmap.file");
-        if mmap_file_path.exists() {
+        if std::fs::symlink_metadata(&mmap_file_path).is_ok() {
             std::fs::remove_file(&mmap_file_path).map_err(|e| {
                 KvError::SharedMem(
                     crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
@@ -567,27 +653,68 @@ impl ClientSegPool {
             })?;
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o666)
-            .open(&mmap_file_path)
-            .map_err(|e| {
-                KvError::SharedMem(
+        let file = if owner_segment_memfd {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd;
+            use std::os::unix::fs::symlink;
+
+            let name = CString::new("fluxon-owner-segment").expect("static memfd name");
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC as u32) };
+            if fd < 0 {
+                return Err(KvError::SharedMem(
                     crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
                         path: mmap_file_path.to_string_lossy().to_string(),
                         len: map_len as u64,
-                        detail: format!("Failed to create mmap.file: {}", e),
+                        detail: format!("memfd_create failed: {}", std::io::Error::last_os_error()),
                     },
-                )
-            })?;
+                ));
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let procfs_target = format!("/proc/{}/fd/{fd}", std::process::id());
+            if let Err(error) = symlink(&procfs_target, &mmap_file_path) {
+                return Err(KvError::SharedMem(
+                    crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
+                        path: mmap_file_path.to_string_lossy().to_string(),
+                        len: map_len as u64,
+                        detail: format!(
+                            "failed to publish memfd procfs symlink target={procfs_target}: {error}"
+                        ),
+                    },
+                ));
+            }
+            tracing::info!(
+                path = %mmap_file_path.display(),
+                target = %procfs_target,
+                len = map_len,
+                "owner DRAM segment uses memfd pathname attach"
+            );
+            file
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o666)
+                .open(&mmap_file_path)
+                .map_err(|e| {
+                    KvError::SharedMem(
+                        crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
+                            path: mmap_file_path.to_string_lossy().to_string(),
+                            len: map_len as u64,
+                            detail: format!("Failed to create mmap.file: {}", e),
+                        },
+                    )
+                })?
+        };
 
         let fd = file.as_raw_fd();
         unsafe {
             let ret = libc::ftruncate(fd, map_len as i64);
             if ret != 0 {
+                if owner_segment_memfd {
+                    let _ = std::fs::remove_file(&mmap_file_path);
+                }
                 return Err(KvError::SharedMem(
                     crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
                         path: mmap_file_path.to_string_lossy().to_string(),
@@ -663,6 +790,7 @@ impl ClientSegPool {
             side_transfer_worker,
             attach_owner_ref,
             allocation_authority,
+            owner_placement_class,
             owner_local_target_bytes,
             cluster_name,
             etcd_addresses,
@@ -751,9 +879,8 @@ impl ClientSegPool {
                         owner_start_time = self_info.node_start_time,
                         peer_count = required_peers.members.len(),
                         owner_peer_count = required_peers.owner_peer_count,
-                        master_peer_count = required_peers.master_peer_count,
                         elapsed_ms = started_at.elapsed().as_millis(),
-                        "required transfer-rpc fast path ready for master and all eligible owner peers"
+                        "required transfer-rpc fast path ready for all eligible owner peers"
                     );
                     return Ok(());
                 }
@@ -763,12 +890,11 @@ impl ClientSegPool {
             if elapsed >= timeout {
                 let detail = if !required_peers.has_complete_roles() {
                     format!(
-                        "required peer roles incomplete within {:?}; self={} start_time={} owner_peer_count={} master_peer_count={}",
+                        "required owner peer set incomplete within {:?}; self={} start_time={} owner_peer_count={}",
                         timeout,
                         self_info.id,
                         self_info.node_start_time,
                         required_peers.owner_peer_count,
-                        required_peers.master_peer_count,
                     )
                 } else {
                     format!(
@@ -1403,6 +1529,7 @@ async fn handle_segment_registration_request(
                 error_code: OK,
                 error_json: String::new(),
                 allocation_authority: inner.allocation_authority,
+                owner_placement_class: inner.owner_placement_class,
                 owner_local_target_bytes: inner.owner_local_target_bytes,
                 seg_map,
             },

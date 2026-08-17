@@ -499,6 +499,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, _OngoingStorageBackup] = {}
+        self.hard_reclaim_writeback_drop_tokens_total = 0
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -1672,24 +1673,50 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 written = self.write_backup(node, write_back=True)
                 if written == 0:
+                    dropped = self._drop_unbacked_device_leaf(node, tracker)
+                    self.hard_reclaim_writeback_drop_tokens_total += dropped
+                    logger.warning(
+                        "HiCache hard reclaim fallback dropped %d device tokens "
+                        "after Host write-back admission failed; cumulative=%d",
+                        dropped,
+                        self.hard_reclaim_writeback_drop_tokens_total,
+                    )
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
                 return
             else:
-                # Write-through: node has no backup, delete entirely.
-                self._record_remove_event(node, medium=StorageMedium.GPU)
-                for comp in self._components_tuple:
-                    self._evict_component_and_detach_lru(
-                        node, comp, target=EvictLayer.ALL, tracker=tracker
-                    )
-                self.evictable_device_leaves.discard(node)
-                parent = node.parent
-                self._remove_leaf_from_parent(node)
-                self._update_evictable_leaf_sets(parent)
-                self._iteratively_delete_tombstone_leaf(node, tracker)
+                self._drop_unbacked_device_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _drop_unbacked_device_leaf(
+        self,
+        node: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+    ) -> int:
+        """Drop an unlocked, device-only cache leaf and return freed Full tokens.
+
+        Prefix KV is recomputable cache state. This is the terminal direct-
+        reclaim fallback when write-back cannot reserve Host space. It is only
+        reachable before a transfer starts; pending transfers hold a lock and
+        are therefore not device leaves.
+        """
+        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        assert not node.backuped, f"node {node.id} unexpectedly has Host backing"
+
+        full_before = tracker[BASE_COMPONENT_TYPE]
+        self._record_remove_event(node, medium=StorageMedium.GPU)
+        for comp in self._components_tuple:
+            self._evict_component_and_detach_lru(
+                node, comp, target=EvictLayer.ALL, tracker=tracker
+            )
+        self.evictable_device_leaves.discard(node)
+        parent = node.parent
+        self._remove_leaf_from_parent(node)
+        self._update_evictable_leaf_sets(parent)
+        self._iteratively_delete_tombstone_leaf(node, tracker)
+        return tracker[BASE_COMPONENT_TYPE] - full_before
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]

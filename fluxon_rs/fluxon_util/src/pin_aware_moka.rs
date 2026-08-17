@@ -102,6 +102,20 @@ pub struct PinAwareMokaSelection {
     pub already_selected_entries: usize,
 }
 
+/// Exact resident-capacity rejection for an atomic bounded insertion.
+///
+/// Unlike Moka's `weighted_size`, `resident_weight` includes entries that are
+/// currently pinned or already selected for asynchronous reclaim. Those
+/// entries still own their physical backing and therefore cannot be reused as
+/// admission credit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PinAwareMokaResidentCapacityError {
+    pub max_capacity: u64,
+    pub resident_weight: u64,
+    pub displaced_weight: u64,
+    pub requested_weight: u64,
+}
+
 impl<Key, PinAlias, Value> Clone for PinAwareMoka<Key, PinAlias, Value> {
     fn clone(&self) -> Self {
         Self {
@@ -177,6 +191,124 @@ where
     PinAlias: Clone + Eq + Hash + Send + Sync + 'static,
     Value: Clone + Send + Sync + 'static,
 {
+    fn insert_under_mutation(
+        &self,
+        key: Key,
+        pin_aliases: Arc<[PinAlias]>,
+        value: Value,
+        weight: u32,
+        resident_limit: Option<u64>,
+    ) -> Result<u64, PinAwareMokaResidentCapacityError> {
+        let (generation, admit, displaced) = {
+            let mut state = self.state.lock();
+
+            let mut displaced_keys = HashSet::new();
+            if state.entries.contains_key(&key) {
+                displaced_keys.insert(key.clone());
+            }
+            for alias in pin_aliases.iter() {
+                if let Some((old_key, _)) = state.aliases.get(alias) {
+                    displaced_keys.insert(old_key.clone());
+                }
+            }
+            let resident_weight = state.entries.values().fold(0u64, |total, entry| {
+                total.saturating_add(u64::from(entry.weight))
+            });
+            let displaced_weight = displaced_keys.iter().fold(0u64, |total, old_key| {
+                total.saturating_add(
+                    state
+                        .entries
+                        .get(old_key)
+                        .map(|entry| u64::from(entry.weight))
+                        .unwrap_or(0),
+                )
+            });
+            if let Some(max_capacity) = resident_limit {
+                let requested_weight = u64::from(weight);
+                if resident_weight
+                    .saturating_sub(displaced_weight)
+                    .saturating_add(requested_weight)
+                    > max_capacity
+                {
+                    return Err(PinAwareMokaResidentCapacityError {
+                        max_capacity,
+                        resident_weight,
+                        displaced_weight,
+                        requested_weight,
+                    });
+                }
+            }
+
+            let generation = state.next_generation;
+            state.next_generation = state
+                .next_generation
+                .checked_add(1)
+                .expect("pin-aware Moka generation space exhausted");
+
+            let mut displaced = Vec::new();
+            for old_key in displaced_keys {
+                if let Some(old) = state.entries.remove(&old_key) {
+                    for alias in old.pin_aliases.iter() {
+                        if state.aliases.get(alias) == Some(&(old_key.clone(), old.generation)) {
+                            state.aliases.remove(alias);
+                        }
+                    }
+                    displaced.push((old_key, old.generation));
+                }
+            }
+
+            let mut pin_count = 0usize;
+            for alias in pin_aliases.iter() {
+                let pending = state.pending_pins.remove(alias).unwrap_or_default();
+                pin_count = pin_count
+                    .checked_add(pending.len())
+                    .expect("pin-aware Moka pin count overflow");
+                for lease_id in pending {
+                    *state
+                        .pin_leases
+                        .get_mut(&lease_id)
+                        .expect("pending pin lease must exist") = PinLease::Assigned {
+                        key: key.clone(),
+                        generation,
+                    };
+                }
+                state
+                    .aliases
+                    .insert(alias.clone(), (key.clone(), generation));
+            }
+            let residency = if pin_count == 0 {
+                Residency::InMoka
+            } else {
+                Residency::Pinned
+            };
+            state.entries.insert(
+                key.clone(),
+                EntryState {
+                    generation,
+                    pin_aliases: pin_aliases.clone(),
+                    value: value.clone(),
+                    weight,
+                    pin_count,
+                    residency,
+                },
+            );
+            let admit = (residency == Residency::InMoka).then(|| MokaEntry {
+                generation,
+                value,
+                weight,
+                _pin_alias: std::marker::PhantomData,
+            });
+            (generation, admit, displaced)
+        };
+        for (old_key, old_generation) in displaced {
+            self.remove_moka_generation(&old_key, old_generation);
+        }
+        if let Some(entry) = admit {
+            self.cache.insert(key, entry);
+        }
+        Ok(generation)
+    }
+
     fn remove_moka_generation(&self, key: &Key, generation: u64) -> bool {
         matches!(
             self.cache.entry(key.clone()).and_compute_with(|current| {
@@ -300,85 +432,38 @@ where
         let weight = (self.inner.weigher)(&key, &value);
         let pin_aliases: Arc<[PinAlias]> = pin_aliases.into();
         let _mutation = self.inner.mutation.lock();
-        let (generation, admit, displaced) = {
-            let mut state = self.inner.state.lock();
-            let generation = state.next_generation;
-            state.next_generation = state
-                .next_generation
-                .checked_add(1)
-                .expect("pin-aware Moka generation space exhausted");
+        self.inner
+            .insert_under_mutation(key, pin_aliases, value, weight, None)
+            .expect("unbounded pin-aware Moka insertion cannot reject")
+    }
 
-            let mut displaced_keys = HashSet::new();
-            if state.entries.contains_key(&key) {
-                displaced_keys.insert(key.clone());
-            }
-            for alias in pin_aliases.iter() {
-                if let Some((old_key, _)) = state.aliases.get(alias) {
-                    displaced_keys.insert(old_key.clone());
-                }
-            }
-            let mut displaced = Vec::new();
-            for old_key in displaced_keys {
-                if let Some(old) = state.entries.remove(&old_key) {
-                    for alias in old.pin_aliases.iter() {
-                        if state.aliases.get(alias) == Some(&(old_key.clone(), old.generation)) {
-                            state.aliases.remove(alias);
-                        }
-                    }
-                    displaced.push((old_key, old.generation));
-                }
-            }
-
-            let mut pin_count = 0usize;
-            for alias in pin_aliases.iter() {
-                let pending = state.pending_pins.remove(alias).unwrap_or_default();
-                pin_count = pin_count
-                    .checked_add(pending.len())
-                    .expect("pin-aware Moka pin count overflow");
-                for lease_id in pending {
-                    *state
-                        .pin_leases
-                        .get_mut(&lease_id)
-                        .expect("pending pin lease must exist") = PinLease::Assigned {
-                        key: key.clone(),
-                        generation,
-                    };
-                }
-                state
-                    .aliases
-                    .insert(alias.clone(), (key.clone(), generation));
-            }
-            let residency = if pin_count == 0 {
-                Residency::InMoka
-            } else {
-                Residency::Pinned
-            };
-            state.entries.insert(
-                key.clone(),
-                EntryState {
-                    generation,
-                    pin_aliases: pin_aliases.clone(),
-                    value: value.clone(),
-                    weight,
-                    pin_count,
-                    residency,
-                },
-            );
-            let admit = (residency == Residency::InMoka).then(|| MokaEntry {
-                generation,
-                value,
-                weight,
-                _pin_alias: std::marker::PhantomData,
-            });
-            (generation, admit, displaced)
-        };
-        for (old_key, old_generation) in displaced {
-            self.inner.remove_moka_generation(&old_key, old_generation);
-        }
-        if let Some(entry) = admit {
-            self.inner.cache.insert(key, entry);
-        }
-        generation
+    /// Atomically insert only when every physically resident entry plus the
+    /// new generation fits the current configured capacity.
+    ///
+    /// Pinned and already-selected entries remain charged until they are
+    /// explicitly invalidated after their external lifecycle completes.
+    pub fn try_insert_with_resident_capacity(
+        &self,
+        key: Key,
+        pin_aliases: impl IntoIterator<Item = PinAlias>,
+        value: Value,
+    ) -> Result<u64, PinAwareMokaResidentCapacityError> {
+        let pin_aliases = pin_aliases.into_iter().collect::<Vec<_>>();
+        assert!(
+            !pin_aliases.is_empty(),
+            "a pin-aware Moka entry must have at least one pin alias"
+        );
+        assert_eq!(
+            pin_aliases.iter().collect::<HashSet<_>>().len(),
+            pin_aliases.len(),
+            "a pin-aware Moka entry cannot contain duplicate pin aliases"
+        );
+        let weight = (self.inner.weigher)(&key, &value);
+        let pin_aliases: Arc<[PinAlias]> = pin_aliases.into();
+        let _mutation = self.inner.mutation.lock();
+        let max_capacity = self.inner.cache.policy().max_capacity().unwrap_or(0);
+        self.inner
+            .insert_under_mutation(key, pin_aliases, value, weight, Some(max_capacity))
     }
 
     /// Pin the entry identified by `alias`, or reserve a pin before insertion.
@@ -636,6 +721,20 @@ where
         self.inner.cache.weighted_size()
     }
 
+    /// Weight of every wrapper-resident generation, including entries hidden
+    /// from Moka while pinned or after selection for asynchronous reclaim.
+    pub fn resident_weighted_size(&self) -> u64 {
+        let _mutation = self.inner.mutation.lock();
+        self.inner
+            .state
+            .lock()
+            .entries
+            .values()
+            .fold(0u64, |total, entry| {
+                total.saturating_add(u64::from(entry.weight))
+            })
+    }
+
     pub fn entry_count(&self) -> u64 {
         self.inner.cache.entry_count()
     }
@@ -710,6 +809,87 @@ mod tests {
     }
 
     #[test]
+    fn resident_capacity_charges_pinned_and_selected_entries_until_invalidation() {
+        let evicted = Arc::new(Mutex::new(Vec::new()));
+        let cache = cache(100, evicted.clone());
+        insert(&cache, "old", "old-alias", 70);
+        assert_eq!(cache.weighted_size(), 70);
+        assert_eq!(cache.resident_weighted_size(), 70);
+
+        let pin = cache.try_pin_alias("old-alias".to_string()).unwrap();
+        cache.run_pending_tasks();
+        assert_eq!(cache.weighted_size(), 0);
+        assert_eq!(cache.resident_weighted_size(), 70);
+        let pinned_reject = cache
+            .try_insert_with_resident_capacity("new".to_string(), ["new-alias".to_string()], 40)
+            .unwrap_err();
+        assert_eq!(
+            pinned_reject,
+            PinAwareMokaResidentCapacityError {
+                max_capacity: 100,
+                resident_weight: 70,
+                displaced_weight: 0,
+                requested_weight: 40,
+            }
+        );
+
+        drop(pin);
+        cache.run_pending_tasks();
+        assert_eq!(cache.evict_some(1), 70);
+        assert_eq!(evicted.lock().as_slice(), &["old".to_string()]);
+        assert_eq!(cache.weighted_size(), 0);
+        assert_eq!(cache.resident_weighted_size(), 70);
+        assert!(
+            cache
+                .try_insert_with_resident_capacity(
+                    "new".to_string(),
+                    ["new-alias".to_string()],
+                    40,
+                )
+                .is_err(),
+            "selected entries still own their physical backing"
+        );
+
+        assert!(cache.invalidate(&"old".to_string()));
+        assert_eq!(cache.resident_weighted_size(), 0);
+        cache
+            .try_insert_with_resident_capacity("new".to_string(), ["new-alias".to_string()], 40)
+            .unwrap();
+        cache.run_pending_tasks();
+        assert_eq!(cache.weighted_size(), 40);
+        assert_eq!(cache.resident_weighted_size(), 40);
+    }
+
+    #[test]
+    fn concurrent_resident_admission_cannot_overbook_capacity() {
+        let cache = cache(100, Arc::new(Mutex::new(Vec::new())));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for index in 0..2 {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                cache
+                    .try_insert_with_resident_capacity(
+                        format!("key-{index}"),
+                        [format!("alias-{index}")],
+                        60,
+                    )
+                    .is_ok()
+            }));
+        }
+        barrier.wait();
+        let accepted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|accepted| *accepted)
+            .count();
+        assert_eq!(accepted, 1);
+        assert_eq!(cache.resident_weighted_size(), 60);
+    }
+
+    #[test]
     fn pin_and_evict_race_has_one_winner() {
         for iteration in 0..100 {
             let evicted = Arc::new(Mutex::new(Vec::new()));
@@ -773,6 +953,25 @@ mod tests {
         insert(&cache, "second", "b", 7);
         assert_eq!(cache.evict_some(13), 19);
         assert_eq!(evicted.lock().len(), 2);
+    }
+
+    #[test]
+    fn explicit_weighted_pop_skips_pinned_entries_until_they_are_released() {
+        let evicted = Arc::new(Mutex::new(Vec::new()));
+        let cache = cache(100, evicted.clone());
+        insert(&cache, "pinned", "pin", 40);
+        insert(&cache, "first", "a", 30);
+        insert(&cache, "second", "b", 30);
+        let pin = cache.try_pin_alias("pin".to_string()).unwrap();
+
+        assert_eq!(cache.evict_some(50), 60);
+        assert_eq!(evicted.lock().len(), 2);
+        assert_eq!(cache.get(&"pinned".to_string()), Some(40));
+
+        drop(pin);
+        cache.run_pending_tasks();
+        assert_eq!(cache.evict_some(1), 40);
+        assert_eq!(evicted.lock().len(), 3);
     }
 
     #[test]

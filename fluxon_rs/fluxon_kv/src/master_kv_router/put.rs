@@ -1,10 +1,9 @@
 use super::{
     CommittedSlotReplica, CompletedReplicaTaskInfo, InflightPutAllocation, InflightPutCommitInfo,
     InflightPutInfo, InflightReplicaTarget, InflightReplicaTaskInfo, KvMemoryReplica,
-    KvNodeReplicas, KvReplicaBacking,
-    MasterKeyActivityCompletionGuard, MasterKvRouterView, NodeCacheCapacityReservation,
-    OwnerHoldingGetInfo, PreparedPutKeyReservationInfo, PutPlacementMode, ReservedCapacityReason,
-    SsdReplicaCommitStatus,
+    KvNodeReplicas, KvReplicaBacking, MasterKeyActivityCompletionGuard, MasterKvRouterView,
+    NodeCacheCapacityReservation, OwnerHoldingGetInfo, PreparedPutKeyReservationInfo,
+    PutPlacementMode, ReservedCapacityReason, SsdReplicaCommitStatus,
     msg_pack::{
         BatchPreparePutKeysReq, BatchPreparePutKeysResp, BatchPublishOwnerSsdReq,
         BatchPublishOwnerSsdResp, BatchPutAppendDoneItemResp, BatchPutAppendDoneReq,
@@ -496,8 +495,96 @@ fn append_current_route_owner_replica_if_matching(
         target_tomb_tag,
     );
     published.then(|| {
-        RoutePublishEvent::replica_append(key.to_string(), put_id, lease_id, node_id, capacity_bytes)
+        RoutePublishEvent::replica_append(
+            key.to_string(),
+            put_id,
+            lease_id,
+            node_id,
+            capacity_bytes,
+        )
     })
+}
+
+fn current_route_has_exact_owner_replica(
+    route: &OneKvNodesRoutes,
+    node_id: &NodeID,
+    target_tomb_tag: &crate::master_seg_manager::NodeTombTag,
+    slot: &CommittedSlotReplica,
+) -> bool {
+    route.node_replicas.read().get(node_id).is_some_and(|replicas| {
+        !replicas.tomb_tag.is_tomb()
+            && replicas.tomb_tag.same_generation(target_tomb_tag)
+            && replicas.memory.as_ref().is_some_and(|memory| {
+                matches!(&memory.backing, KvReplicaBacking::CommittedSlot(current) if current == slot)
+            })
+    })
+}
+
+#[cfg(test)]
+mod exact_owner_replica_tests {
+    use super::{
+        CommittedSlotReplica, KvMemoryReplica, KvNodeReplicas, KvReplicaBacking, OneKvNodesRoutes,
+        current_route_has_exact_owner_replica,
+    };
+    use crate::cluster_manager::NodeID;
+    use crate::master_seg_manager::NodeTombTag;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn existing_exact_get_slot_satisfies_replica_append_without_replacing_local_index() {
+        let node: NodeID = "target-owner".to_string().into();
+        let tag = NodeTombTag::new();
+        let slot = CommittedSlotReplica {
+            owner: crate::owner_segment::OwnerGeneration::new(node.clone(), 7),
+            allocation_id: 41,
+            segment_offset: 4096,
+            capacity_bytes: 8192,
+            addr: 0x2000,
+            len: 5000,
+            base_addr: 0x1000,
+            segment_registration_epoch: 3,
+        };
+        let route = OneKvNodesRoutes {
+            put_id: (9, 2),
+            radix: None,
+            lease_id: None,
+            atomic_group: None,
+            node_replicas: RwLock::new(HashMap::from([(
+                node.clone(),
+                KvNodeReplicas::memory(
+                    tag.clone(),
+                    KvMemoryReplica {
+                        backing: KvReplicaBacking::CommittedSlot(slot.clone()),
+                        owner_local_indexed: true,
+                        get_durable_reservation: None,
+                        capacity_reservation: None,
+                    },
+                ),
+            )])),
+            get_durable_slots_used: AtomicU32::new(0),
+        };
+
+        assert!(current_route_has_exact_owner_replica(
+            &route, &node, &tag, &slot
+        ));
+        let mut different = slot.clone();
+        different.allocation_id += 1;
+        assert!(!current_route_has_exact_owner_replica(
+            &route, &node, &tag, &different
+        ));
+        assert!(!current_route_has_exact_owner_replica(
+            &route,
+            &node,
+            &NodeTombTag::new(),
+            &slot,
+        ));
+        tag.set_tomb();
+        assert!(!current_route_has_exact_owner_replica(
+            &route, &node, &tag, &slot
+        ));
+    }
 }
 
 fn allocate_from_node_local_segment(
@@ -746,6 +833,7 @@ fn reserve_replica_task_excluding(
         key: key.to_string(),
         put_id,
         len,
+        atomic_batch: None,
         protect_source_on_remote_complete,
         _activity_lease: activity_lease,
     })
@@ -758,6 +846,7 @@ fn reserve_owner_replica_task_excluding(
     source_node_id: &NodeID,
     preferred_sub_cluster: Option<&str>,
     len: u64,
+    atomic_batch: Option<Arc<PutAtomicGroup>>,
     excluded_nodes: &HashSet<NodeID>,
     protect_source_on_remote_complete: bool,
 ) -> msg_and_error::KvResult<InflightReplicaTaskInfo> {
@@ -778,13 +867,13 @@ fn reserve_owner_replica_task_excluding(
             key,
             put_id,
         );
-    let candidates = select_remote_owner_candidates(
+    let plan = select_remote_owner_candidates(
         view,
         source_node_id,
         excluded_nodes,
         preferred_sub_cluster,
         len,
-        &view.master_kv_router().inner().replica_task_placement,
+        operation_id,
     )?;
     tracing::debug!(
         key,
@@ -792,7 +881,9 @@ fn reserve_owner_replica_task_excluding(
         put_version = put_id.1,
         operation_id,
         source_node_id = %source_node_id,
-        candidate_count = candidates.len(),
+        candidate_count = plan.candidates.len(),
+        policy_epoch = plan.policy_epoch,
+        capacity_snapshot_id = plan.capacity_snapshot_id,
         "owner replica task planned without master allocation"
     );
     let source_member = view
@@ -809,11 +900,12 @@ fn reserve_owner_replica_task_excluding(
             source_member.id,
             source_member.node_start_time,
         ),
-        target: InflightReplicaTarget::OwnerCandidates { candidates },
+        target: InflightReplicaTarget::OwnerCandidates { plan },
         source_node_id: source_node_id.clone(),
         key: key.to_string(),
         put_id,
         len,
+        atomic_batch,
         protect_source_on_remote_complete,
         _activity_lease: activity_lease,
     })
@@ -1023,12 +1115,22 @@ pub async fn handle_put_start(
                 .await;
 
             let response_replica_target = replica_target.as_ref().map(|target| {
-                let target_allocation_guard = target.target_allocation.lock();
+                let InflightReplicaTarget::MasterAllocation {
+                    node_id,
+                    target_allocation,
+                    ..
+                } = &target.target
+                else {
+                    unreachable!(
+                        "normal Put pre-reservation must remain master-authoritative until stage D"
+                    );
+                };
+                let target_allocation_guard = target_allocation.lock();
                 let target_allocation = target_allocation_guard.as_ref().expect(
                     "replica target allocation must exist while building put_start response",
                 );
                 super::msg_pack::PutReplicaTarget {
-                    node_id: target.node_id.clone().into(),
+                    node_id: node_id.clone().into(),
                     target_addr: target_allocation.base_addr() + target_allocation.addr(),
                     target_base_addr: target_allocation.base_addr(),
                     len: target_allocation.size(),
@@ -1144,8 +1246,15 @@ pub async fn handle_put_start(
                     req.serialize_part.len,
                 ) {
                     Ok(reservation) => {
+                        let InflightReplicaTarget::MasterAllocation { node_id, .. } =
+                            &reservation.target
+                        else {
+                            unreachable!(
+                                "normal Put replica pre-reservation must use master allocation"
+                            );
+                        };
                         view.master_kv_router()
-                            .record_replica_task_target(reservation.node_id.as_ref());
+                            .record_replica_task_target(node_id.as_ref());
                         Some(reservation)
                     }
                     Err(msg_and_error::KvError::Api(msg_and_error::ApiError::NoSpace {
@@ -2281,6 +2390,9 @@ async fn handle_put_append_start_inner(
         };
     }
 
+    let route_atomic_batch = route_snapshot
+        .as_ref()
+        .and_then(|route| route.atomic_group.as_ref().cloned());
     let inflight = if let Some(existing) = view
         .master_kv_router()
         .inner()
@@ -2310,6 +2422,7 @@ async fn handle_put_append_start_inner(
             &req_node_id,
             req.serialize_part.preferred_sub_cluster.as_deref(),
             req.serialize_part.len,
+            route_atomic_batch,
             &excluded_nodes,
             req.serialize_part.protect_source_on_remote_complete,
         ) {
@@ -2351,11 +2464,11 @@ async fn handle_put_append_start_inner(
                 };
             }
         };
-        if let InflightReplicaTarget::OwnerCandidates { candidates } = &reservation.target
-            && let Some(first) = candidates.first()
+        if let InflightReplicaTarget::OwnerCandidates { plan } = &reservation.target
+            && let Some(first) = plan.candidates.first()
         {
             view.master_kv_router()
-                .record_replica_task_target(&first.node_id);
+                .record_replica_task_target(&first.owner.node_id);
         }
         view.master_kv_router()
             .inner()
@@ -2364,7 +2477,7 @@ async fn handle_put_append_start_inner(
             .await;
         reservation
     };
-    let InflightReplicaTarget::OwnerCandidates { candidates } = &inflight.target else {
+    let InflightReplicaTarget::OwnerCandidates { plan } = &inflight.target else {
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
             detail: format!(
                 "replica append found a master-allocation reservation after owner protocol activation: key={} put_id=({},{})",
@@ -2381,19 +2494,18 @@ async fn handle_put_append_start_inner(
         inflight.operation_id,
         crate::owner_segment::OwnerTransferOpKind::ReplicaAppend,
     );
-    let atomic_batch = route_snapshot
-        .as_ref()
-        .and_then(|route| route.atomic_group.as_deref().cloned());
-    let owner_candidates = candidates
+    let atomic_batch = inflight.atomic_batch.as_deref().cloned();
+    let owner_candidates = plan
+        .candidates
         .iter()
         .cloned()
-        .map(|target_owner| crate::owner_segment::OwnerTargetRouteToken {
+        .map(|candidate| crate::owner_segment::OwnerTargetRouteToken {
             key: key.clone(),
             put_id,
             operation: operation.clone(),
-            target_owner,
+            target_owner: candidate.owner,
             prior_route_epoch: 0,
-            policy_epoch: 0,
+            policy_epoch: plan.policy_epoch,
             atomic_batch: atomic_batch.clone(),
             plan_nonce: inflight.operation_id,
         })
@@ -2579,14 +2691,36 @@ async fn handle_put_append_done_inner(
         .get(&generation_identity)
         .await
     else {
-        let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
-            detail: format!(
-                "Put append operation not found for completion: key={} put_id=({},{}) operation_id={}",
-                key, put_id.0, put_id.1, operation_id
-            ),
-        });
+        // Start may have been revoked, superseded, or expired while the
+        // target was transferring. That is a definitive obsolete terminal
+        // for this immutable operation. Cache it before replying so response
+        // loss cannot turn the same Done into an unbounded retry loop.
+        view.master_kv_router()
+            .inner()
+            .completed_replica_tasks
+            .insert(
+                operation_identity,
+                CompletedReplicaTaskInfo {
+                    appended: false,
+                    route_epoch: 0,
+                },
+            )
+            .await;
+        tracing::debug!(
+            key,
+            put_time_ms = put_id.0,
+            put_version = put_id.1,
+            operation_id,
+            "Put append reservation is absent at Done; publishing an obsolete replay terminal"
+        );
         return MsgPack {
-            serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+            serialize_part: PutAppendDoneResp {
+                appended: false,
+                route_epoch: 0,
+                error_code: msg_and_error::OK,
+                error_json: String::new(),
+                server_process_us: 0,
+            },
             raw_bytes: Vec::new(),
         };
     };
@@ -2608,21 +2742,19 @@ async fn handle_put_append_done_inner(
     ) {
         (Some(slot), Some(token)) => (slot, token),
         _ => {
-            let err = msg_and_error::KvError::Api(
-                msg_and_error::ApiError::InvalidPutMasterState {
-                    detail: format!(
-                        "owner replica completion is missing committed slot or route token: key={} put_id=({},{}) operation_id={}",
-                        key, put_id.0, put_id.1, operation_id
-                    ),
-                },
-            );
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
+                detail: format!(
+                    "owner replica completion is missing committed slot or route token: key={} put_id=({},{}) operation_id={}",
+                    key, put_id.0, put_id.1, operation_id
+                ),
+            });
             return MsgPack {
                 serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
                 raw_bytes: Vec::new(),
             };
         }
     };
-    let InflightReplicaTarget::OwnerCandidates { candidates } = &current.target else {
+    let InflightReplicaTarget::OwnerCandidates { plan } = &current.target else {
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
             detail: "owner replica completion matched a master-allocation reservation".to_string(),
         });
@@ -2636,35 +2768,71 @@ async fn handle_put_append_done_inner(
         operation_id,
         crate::owner_segment::OwnerTransferOpKind::ReplicaAppend,
     );
-    let current_atomic_batch = view
-        .master_kv_router()
-        .inner()
-        .kv_routes
-        .get(&key)
-        .and_then(|route| route.atomic_group.as_deref().cloned());
-    let target_is_candidate = candidates
+    let expected_atomic_batch = current.atomic_batch.as_deref().cloned();
+    let target_is_candidate = plan
+        .candidates
         .iter()
-        .any(|candidate| candidate == &route_token.target_owner);
-    if route_token.key != key
-        || route_token.put_id != put_id
-        || route_token.operation != expected_operation
-        || route_token.plan_nonce != operation_id
-        || route_token.atomic_batch != current_atomic_batch
-        || !target_is_candidate
-        || route_token.target_owner.node_id.as_str() != req_node_id.as_ref()
-        || committed_slot.owner != route_token.target_owner
-        || committed_slot.len != current.len
-    {
+        .any(|candidate| candidate.owner == route_token.target_owner);
+    let mut identity_mismatches = Vec::new();
+    if route_token.key != key {
+        identity_mismatches.push("key");
+    }
+    if route_token.put_id != put_id {
+        identity_mismatches.push("put_id");
+    }
+    if route_token.operation != expected_operation {
+        identity_mismatches.push("operation");
+    }
+    if route_token.plan_nonce != operation_id {
+        identity_mismatches.push("plan_nonce");
+    }
+    if route_token.policy_epoch != plan.policy_epoch {
+        identity_mismatches.push("policy_epoch");
+    }
+    if route_token.atomic_batch != expected_atomic_batch {
+        identity_mismatches.push("atomic_batch");
+    }
+    if !target_is_candidate {
+        identity_mismatches.push("target_candidate");
+    }
+    if route_token.target_owner.node_id.as_str() != req_node_id.as_ref() {
+        identity_mismatches.push("caller_node");
+    }
+    if committed_slot.owner != route_token.target_owner {
+        identity_mismatches.push("slot_owner_generation");
+    }
+    if committed_slot.len != current.len {
+        identity_mismatches.push("len");
+    }
+    if !identity_mismatches.is_empty() {
         let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidPutMasterState {
             detail: format!(
-                "owner replica completion identity mismatch: key={} put_id=({},{}) operation_id={} caller={} target={} slot_owner={}",
+                "owner replica completion identity mismatch: fields={:?} key={} put_id=({},{}) operation_id={} caller={} target=({},{}) slot_owner=({},{}) expected_coordinator=({},{}) actual_coordinator=({},{}) expected_policy_epoch={} actual_policy_epoch={} expected_len={} actual_len={} expected_atomic_members={} actual_atomic_members={}",
+                identity_mismatches,
                 key,
                 put_id.0,
                 put_id.1,
                 operation_id,
                 req_node_id,
                 route_token.target_owner.node_id,
+                route_token.target_owner.node_start_time,
                 committed_slot.owner.node_id,
+                committed_slot.owner.node_start_time,
+                expected_operation.coordinator.node_id,
+                expected_operation.coordinator.node_start_time,
+                route_token.operation.coordinator.node_id,
+                route_token.operation.coordinator.node_start_time,
+                plan.policy_epoch,
+                route_token.policy_epoch,
+                current.len,
+                committed_slot.len,
+                expected_atomic_batch
+                    .as_ref()
+                    .map_or(0, |group| group.members.len()),
+                route_token
+                    .atomic_batch
+                    .as_ref()
+                    .map_or(0, |group| group.members.len()),
             ),
         });
         return MsgPack {
@@ -2703,15 +2871,33 @@ async fn handle_put_append_done_inner(
     let _activity_completion =
         MasterKeyActivityCompletionGuard::new(inflight._activity_lease.clone());
     let route_epoch = validated_slot.allocation_id;
-    let published = append_current_route_owner_replica_if_matching(
-        &view,
-        &key,
-        inflight.put_id,
-        req_node_id,
-        target_tomb_tag,
-        validated_slot,
-    );
-    let appended = published.is_some();
+    let existing_exact = view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .get(&key)
+        .is_some_and(|route| {
+            route.put_id == inflight.put_id
+                && current_route_has_exact_owner_replica(
+                    &route,
+                    &req_node_id,
+                    &target_tomb_tag,
+                    &validated_slot,
+                )
+        });
+    let published = (!existing_exact)
+        .then(|| {
+            append_current_route_owner_replica_if_matching(
+                &view,
+                &key,
+                inflight.put_id,
+                req_node_id,
+                target_tomb_tag,
+                validated_slot,
+            )
+        })
+        .flatten();
+    let appended = existing_exact || published.is_some();
     let committed_route_epoch = if appended { route_epoch } else { 0 };
     view.master_kv_router()
         .inner()

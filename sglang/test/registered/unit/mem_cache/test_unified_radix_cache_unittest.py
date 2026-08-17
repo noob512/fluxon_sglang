@@ -3143,9 +3143,8 @@ class UnifiedRadixCacheSuite:
             [conv[:, mamba_indices].float().cpu().clone() for conv in mamba_cache.conv],
         )
 
-    def test_hicache_evict_device_leaf_aborts_demote_when_backup_fails(self):
-        """when write_backup cannot allocate host pool,
-        _evict_device_leaf should not evict it to host."""
+    def test_hicache_evict_device_leaf_drops_cache_when_backup_admission_fails(self):
+        """Direct reclaim must free an unlocked leaf even when Host is full."""
         if self._skip_unsupported_hicache_test():
             return
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -3161,15 +3160,23 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(node.evicted)
 
         tracker = {c: 0 for c in tree.tree_components}
+        available_before = allocator.available_size()
         with mock.patch.object(tree, "write_backup", return_value=0):
             tree._evict_device_leaf(node, tracker)
 
-        self.assertFalse(node.evicted)
-        self.assertIsNotNone(node.component_data[ct].value)
+        self.assertTrue(node.evicted)
+        self.assertIsNone(node.component_data[ct].value)
         self.assertIsNone(node.component_data[ct].host_value)
-
-        with self.assertRaises(AssertionError):
-            tree._evict_to_host(node, {c: 0 for c in tree.tree_components})
+        self.assertGreater(tracker[ct], 0)
+        self.assertEqual(
+            tree.hard_reclaim_writeback_drop_tokens_total,
+            tracker[ct],
+        )
+        self.assertEqual(
+            allocator.available_size() - available_before,
+            tracker[ct],
+        )
+        self.assertNotIn(node, tree.evictable_device_leaves)
 
         tree.sanity_check()
 

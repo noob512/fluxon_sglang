@@ -30,8 +30,7 @@ use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
 use fluxon_kv::external_client_api::ExternalClientApiViewTrait;
 use fluxon_kv::master_kv_router::msg_pack::{
-    BatchPreparePutKeyItemReq, PutDoneCommittedSlot, RadixKvMetadata,
-    build_put_atomic_group_assignments,
+    BatchPreparePutKeyItemReq, RadixKvMetadata, build_put_atomic_group_assignments,
 };
 use fluxon_kv::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use fluxon_kv::memholder::kvclient_encode::{BorrowedFlatKvValueRange, flat_kv_decode_borrowed};
@@ -4054,17 +4053,27 @@ impl KvClient {
                         let inner = client_kv_api_view.client_kv_api().inner();
                         let slot_refs = owner_data.slot_lease.slots.clone();
                         let slot_size = owner_data.slot_lease.slot_size;
+                        let invalid_slot_count = slot_refs
+                            .iter()
+                            .filter(|slot| {
+                                !slot.is_valid()
+                                    || slot.len != owner_data.value_len
+                                    || slot.capacity_bytes != slot_size
+                            })
+                            .count();
                         if slot_refs.len() != owner_data.keys.len()
                             || owner_data.make_replica_task_mask.len() != owner_data.keys.len()
                             || owner_data.radix_metadata.len() != owner_data.keys.len()
+                            || invalid_slot_count != 0
                         {
                             let err = CoreKvError::Api(CoreApiError::Unknown {
                                 detail: format!(
-                                    "local_fast_put_commit staged length mismatch: keys={} slots={} replica_mask={} radix_metadata={}",
+                                    "local_fast_put_commit staged identity mismatch: keys={} slots={} replica_mask={} radix_metadata={} invalid_slots={}",
                                     owner_data.keys.len(),
                                     slot_refs.len(),
                                     owner_data.make_replica_task_mask.len(),
-                                    owner_data.radix_metadata.len()
+                                    owner_data.radix_metadata.len(),
+                                    invalid_slot_count,
                                 ),
                             });
                             let _ = release_staged_put_resources(
@@ -4140,7 +4149,7 @@ impl KvClient {
                             let memory_info = inner
                                 .build_local_reserve_resident_memory_info(
                                     key,
-                                    slot_ref.ptr,
+                                    slot_ref.addr,
                                     value_len_u32,
                                     slot_ref.allocation_id,
                                     slot_ref.segment_offset,
@@ -4155,14 +4164,7 @@ impl KvClient {
                                 put_id,
                                 value_len: owner_data.value_len,
                                 lease_id: None,
-                                committed_slot: PutDoneCommittedSlot {
-                                    allocation_id: slot_ref.allocation_id,
-                                    segment_offset: slot_ref.segment_offset,
-                                    capacity_bytes: slot_ref.capacity_bytes,
-                                    addr: slot_ref.ptr,
-                                    base_addr: slot_ref.base_addr,
-                                    len: owner_data.value_len,
-                                },
+                                committed_slot: slot_ref.clone(),
                                 make_replica_task: *make_replica_task,
                                 // This owner-local path has no earlier remote
                                 // reservation. Selected items are admitted to
@@ -6751,7 +6753,7 @@ impl KvClient {
             client: &KvClient,
             py: Python,
         ) -> ApiResult<PyObject> {
-            let _framework = match require_kv_framework_api(client, py) {
+            let framework = match require_kv_framework_api(client, py) {
                 Ok(v) => v,
                 Err(e) => return ApiResult::new_error(e),
             };
@@ -6767,6 +6769,10 @@ impl KvClient {
             let locality_counters = client.locality_counters.clone();
             let future = async move {
                 let metrics = locality_counters.snapshot();
+                let reliability = framework
+                    .external_client_api_view()
+                    .external_client_api()
+                    .planned_get_reliability_snapshot();
                 Python::with_gil(|py| {
                     let out = PyDict::new_bound(py);
                     out.set_item("l2_local_hit_pages", metrics.l2_local_hit_pages)
@@ -6777,6 +6783,16 @@ impl KvClient {
                         .expect("set l2_remote_hit_pages");
                     out.set_item("l2_remote_hit_bytes", metrics.l2_remote_hit_bytes)
                         .expect("set l2_remote_hit_bytes");
+                    out.set_item(
+                        "master_get_plan_hit_items",
+                        reliability.master_plan_hit_items,
+                    )
+                    .expect("set master_get_plan_hit_items");
+                    out.set_item(
+                        "planned_cpu_direct_miss_items",
+                        reliability.direct_miss_items,
+                    )
+                    .expect("set planned_cpu_direct_miss_items");
                     let io = PyDict::new_bound(py);
                     for (key, item) in [
                         ("put_local", metrics.put_local.clone()),

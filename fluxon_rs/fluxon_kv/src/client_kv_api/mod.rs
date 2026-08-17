@@ -31,18 +31,18 @@ use crate::master_kv_router::msg_pack::{
     BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq,
     BatchPreparePutKeysReq, BatchPublishOwnerSsdReq, BatchPutAppendDoneReq, BatchPutAppendStartReq,
     BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
-    DeleteClientKvMetaCacheItem, GroupedBatchPutDoneReq, RadixKvMetadata,
+    DeleteClientKvMetaCacheItem, GetBindTarget, GroupedBatchPutDoneReq, RadixKvMetadata,
 };
 use crate::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use crate::memholder::{AllMemholderRefCount, ExternalMemHolderInfo, MemoryInfo, UserMemHolder};
-use crate::owner_segment::{
-    OwnerSegmentTransferItem, OwnerSegmentTransferItemResp, OwnerSegmentTransferOutcome,
-    OwnerSegmentTransferReq, OwnerSegmentTransferResp, OwnerTransferErrorCode,
-    OwnerTransferItemError,
-};
 use crate::memholder::{
     EnsureMemholderMgmtDeleteHandle, MemholderManagerTrait, NodeHolderKey, OwnerDeleteAckItem,
     OwnerDeleteAckMemMgr, OwnerExternalMemMgr,
+};
+use crate::owner_segment::{
+    OWNER_TRANSFER_CLIENT_ACK_STREAM, OwnerSegmentTransferItem, OwnerSegmentTransferItemResp,
+    OwnerSegmentTransferOutcome, OwnerSegmentTransferReq, OwnerSegmentTransferResp,
+    OwnerTransferErrorCode, OwnerTransferItemError, OwnerTransferPeerTracker,
 };
 use crate::{
     client_seg_pool::{ClientSegPool, ClientSegPoolAccessTrait, ResolveSideTransferLaneReq},
@@ -59,7 +59,7 @@ use crate::{
     p2p::{
         control_plane_rpc::{call_control_plane_rpc, send_control_plane_rpc_response},
         msg_pack::{RPCCaller, RPCHandler},
-        p2p_module::{P2pModule, P2pModuleAccessTrait, RpcTransportPolicy},
+        p2p_module::{P2pModule, P2pModuleAccessTrait},
     },
     rpcresp_kvresult_convert::msg_and_error::{ApiError, ErrorCode, KvError, KvResult},
 };
@@ -97,6 +97,193 @@ struct SsdStageSharedOp {
     request: SsdStageReadReq,
     terminal: watch::Sender<Option<SsdStageReadResp>>,
     completed: AtomicBool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnerGetToTargetRequest {
+    ack_stream_id: u64,
+    terminal_sequence: u64,
+    source: crate::owner_segment::OwnerGetSourceCapability,
+    destination: crate::owner_segment::OwnerGetDestinationCapability,
+}
+
+#[derive(Clone)]
+enum OwnerGetToTargetSourceHold {
+    Memory(crate::owner_segment::OwnerLeaseId),
+    Ssd { lease: OwnerSlotLease, get_id: u64 },
+}
+
+/// Process-scoped Get transfer singleflight. The leader is spawned outside
+/// the inbound RPC future, so a lost control-plane response cannot cancel an
+/// already-issued WRITE or strand its source read lease. Entries deliberately
+/// remain replayable for the owner generation; cumulative acknowledgement
+/// watermarks, rather than a per-Get RPC, reclaim cached terminals.
+struct OwnerGetToTargetSharedOp {
+    request: OwnerGetToTargetRequest,
+    terminal: watch::Sender<Option<OwnerSegmentTransferOutcome>>,
+    completed: AtomicBool,
+    /// Populated only when a local source-release operation itself fails. A
+    /// successful WRITE releases before publishing its transfer terminal.
+    unreleased_source_hold: Mutex<Option<OwnerGetToTargetSourceHold>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnerPutFromSourceRequest {
+    ack_stream_id: u64,
+    terminal_sequence: u64,
+    target_attempt: u32,
+    target_plan: crate::owner_segment::OwnerTargetRouteToken,
+    source: crate::owner_segment::OwnerSourceReadCapability,
+    disposition: crate::owner_segment::OwnerTargetDisposition,
+    route_commit_mode: crate::owner_segment::OwnerRouteCommitMode,
+}
+
+/// Target-side singleflight for one exact Put/replica attempt.  The leader is
+/// detached from the inbound RPC lifetime, so an ambiguous response cannot
+/// cancel an already-issued RDMA READ or make a retry allocate/read again.
+struct OwnerPutFromSourceSharedOp {
+    request: OwnerPutFromSourceRequest,
+    terminal: watch::Sender<Option<OwnerSegmentTransferOutcome>>,
+    completed: AtomicBool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnerTargetRouteCommitRequest {
+    lease_id: crate::owner_segment::OwnerLeaseId,
+    receipt: crate::owner_segment::OwnerTransferReceipt,
+    route_token: Option<crate::owner_segment::OwnerTargetRouteToken>,
+    route_commit_mode: crate::owner_segment::OwnerRouteCommitMode,
+}
+
+/// One detached metadata commit per target operation. Both Async and Sync
+/// callers use this exact task; only the caller's wait point differs.
+struct OwnerTargetRouteCommitSharedOp {
+    request: OwnerTargetRouteCommitRequest,
+    terminal: watch::Sender<Option<OwnerSegmentTransferOutcome>>,
+    completed: AtomicBool,
+}
+
+impl OwnerTargetRouteCommitSharedOp {
+    fn new(request: OwnerTargetRouteCommitRequest) -> Arc<Self> {
+        let (terminal, _receiver) = watch::channel(None);
+        Arc::new(Self {
+            request,
+            terminal,
+            completed: AtomicBool::new(false),
+        })
+    }
+
+    fn complete(&self, outcome: OwnerSegmentTransferOutcome) -> bool {
+        if self
+            .completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.terminal.send_replace(Some(outcome));
+        true
+    }
+
+    async fn wait(&self) -> OwnerSegmentTransferOutcome {
+        let mut terminal = self.terminal.subscribe();
+        loop {
+            if let Some(outcome) = terminal.borrow_and_update().clone() {
+                return outcome;
+            }
+            if terminal.changed().await.is_err() {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::Internal,
+                    "CommitTarget task closed without a terminal",
+                ));
+            }
+        }
+    }
+}
+
+impl OwnerPutFromSourceSharedOp {
+    fn new(request: OwnerPutFromSourceRequest) -> Arc<Self> {
+        let (terminal, _receiver) = watch::channel(None);
+        Arc::new(Self {
+            request,
+            terminal,
+            completed: AtomicBool::new(false),
+        })
+    }
+
+    fn complete(&self, outcome: OwnerSegmentTransferOutcome) -> bool {
+        if self
+            .completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.terminal.send_replace(Some(outcome));
+        true
+    }
+
+    async fn wait(&self) -> OwnerSegmentTransferOutcome {
+        let mut terminal = self.terminal.subscribe();
+        loop {
+            if let Some(outcome) = terminal.borrow_and_update().clone() {
+                return outcome;
+            }
+            if terminal.changed().await.is_err() {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::Internal,
+                    "PutFromSource singleflight closed without a terminal",
+                ));
+            }
+        }
+    }
+}
+
+impl OwnerGetToTargetSharedOp {
+    fn new(request: OwnerGetToTargetRequest) -> Arc<Self> {
+        let (terminal, _receiver) = watch::channel(None);
+        Arc::new(Self {
+            request,
+            terminal,
+            completed: AtomicBool::new(false),
+            unreleased_source_hold: Mutex::new(None),
+        })
+    }
+
+    fn retain_unreleased_source_hold(&self, hold: OwnerGetToTargetSourceHold) {
+        let previous = self.unreleased_source_hold.lock().replace(hold);
+        assert!(
+            previous.is_none(),
+            "one GetToTarget operation must retain at most one failed-cleanup source hold"
+        );
+    }
+
+    fn complete(&self, outcome: OwnerSegmentTransferOutcome) -> bool {
+        if self
+            .completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.terminal.send_replace(Some(outcome));
+        true
+    }
+
+    async fn wait(&self) -> OwnerSegmentTransferOutcome {
+        let mut terminal = self.terminal.subscribe();
+        loop {
+            if let Some(outcome) = terminal.borrow_and_update().clone() {
+                return outcome;
+            }
+            if terminal.changed().await.is_err() {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::Internal,
+                    "GetToTarget singleflight closed without a terminal",
+                ));
+            }
+        }
+    }
 }
 
 impl SsdStageSharedOp {
@@ -203,6 +390,932 @@ mod ssd_stage_singleflight_tests {
             assert!(response.error_json.is_empty());
         }
         assert_eq!(Arc::strong_count(&op), 1);
+    }
+}
+
+#[cfg(test)]
+mod owner_get_to_target_singleflight_tests {
+    use super::{
+        ClientKvApi, ClientKvApiNewArg, OwnerGetToTargetRequest, OwnerGetToTargetSharedOp,
+        OwnerGetToTargetSourceHold, apply_owner_transfer_terminal_ack,
+        release_owner_get_to_target_source_hold,
+    };
+    use crate::config::TestSpecConfig;
+    use crate::master_seg_manager::msg_pack::SegmentAllocationAuthority;
+    use crate::owner_segment::{
+        OwnerGeneration, OwnerGetDestinationCapability, OwnerGetTransferReceipt,
+        OwnerSegmentTransferOutcome, OwnerSlotScope, OwnerSourceRouteToken, OwnerTransferOpId,
+        OwnerTransferOpKind, OwnerTransferOutcome,
+    };
+
+    #[limit_thirdparty::tokio::test]
+    async fn all_followers_reuse_one_get_to_target_terminal() {
+        let op = OwnerGetToTargetSharedOp::new(OwnerGetToTargetRequest {
+            ack_stream_id: 1,
+            terminal_sequence: 1,
+            source: crate::owner_segment::OwnerGetSourceCapability::Memory(
+                OwnerSourceRouteToken::default(),
+            ),
+            destination: OwnerGetDestinationCapability::Invalid,
+        });
+        let followers = futures::future::join_all((0..8).map(|_| {
+            let op = op.clone();
+            async move { op.wait().await }
+        }));
+        let expected = OwnerSegmentTransferOutcome::GetToTargetCompleted {
+            receipt: OwnerGetTransferReceipt::default(),
+        };
+        let leader = async {
+            assert!(op.complete(expected.clone()));
+            assert!(!op.complete(OwnerSegmentTransferOutcome::Invalid));
+        };
+        let (followers, ()) = futures::future::join(followers, leader).await;
+        for follower in followers {
+            assert_eq!(follower, expected);
+        }
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn ack_watermark_reclaims_only_completed_get_terminals() {
+        let api = ClientKvApi::construct(ClientKvApiNewArg {
+            test_spec_config: TestSpecConfig::default(),
+            owner_hot_cache_capacity_bytes: None,
+            owner_local_reserve_physical_capacity_bytes: 0,
+            allocation_authority: SegmentAllocationAuthority::Master,
+            owner_placement_class:
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
+            ssd_storage: None,
+        })
+        .await
+        .expect("construct terminal ACK test client");
+        let caller = OwnerGeneration::new("requester", 19);
+        let completed_id = OwnerTransferOpId::new(caller.clone(), 5, OwnerTransferOpKind::Get);
+        let pending_id = OwnerTransferOpId::new(caller.clone(), 6, OwnerTransferOpKind::Get);
+        let completed = OwnerGetToTargetSharedOp::new(OwnerGetToTargetRequest {
+            ack_stream_id: 1,
+            terminal_sequence: 1,
+            source: crate::owner_segment::OwnerGetSourceCapability::Invalid,
+            destination: OwnerGetDestinationCapability::Invalid,
+        });
+        assert!(
+            completed.complete(OwnerSegmentTransferOutcome::GetToTargetCompleted {
+                receipt: OwnerGetTransferReceipt::default(),
+            })
+        );
+        let pending = OwnerGetToTargetSharedOp::new(OwnerGetToTargetRequest {
+            ack_stream_id: 1,
+            terminal_sequence: 2,
+            source: crate::owner_segment::OwnerGetSourceCapability::Invalid,
+            destination: OwnerGetDestinationCapability::Invalid,
+        });
+        api.inner()
+            .owner_get_to_target_flights
+            .insert(completed_id.clone(), completed);
+        api.inner()
+            .owner_get_to_target_flights
+            .insert(pending_id.clone(), pending.clone());
+
+        assert_eq!(
+            apply_owner_transfer_terminal_ack(api.inner(), &caller, 1, 2),
+            2
+        );
+        assert!(
+            !api.inner()
+                .owner_get_to_target_flights
+                .contains_key(&completed_id)
+        );
+        assert!(
+            api.inner()
+                .owner_get_to_target_flights
+                .contains_key(&pending_id)
+        );
+
+        assert!(pending.complete(OwnerSegmentTransferOutcome::Error(
+            crate::owner_segment::OwnerTransferItemError::new(
+                crate::owner_segment::OwnerTransferErrorCode::Internal,
+                "test terminal",
+            ),
+        )));
+        assert_eq!(
+            apply_owner_transfer_terminal_ack(api.inner(), &caller, 1, 2),
+            2
+        );
+        assert!(
+            !api.inner()
+                .owner_get_to_target_flights
+                .contains_key(&pending_id)
+        );
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn successful_get_releases_source_on_write_completion() {
+        const SEGMENT_BYTES: u64 = 64 * 1024;
+        const VALUE_LEN: u64 = 5000;
+        let api = ClientKvApi::construct(ClientKvApiNewArg {
+            test_spec_config: TestSpecConfig::default(),
+            owner_hot_cache_capacity_bytes: None,
+            owner_local_reserve_physical_capacity_bytes: 0,
+            allocation_authority: SegmentAllocationAuthority::Master,
+            owner_placement_class:
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
+            ssd_storage: None,
+        })
+        .await
+        .expect("construct GetToTarget acknowledgement test client");
+        let source_owner = OwnerGeneration::new("source-owner", 11);
+        let source_slot = {
+            let mut allocator = api.inner().owner_segment_allocator.lock();
+            allocator
+                .install_segment(
+                    source_owner.clone(),
+                    17,
+                    0x1000,
+                    0x1000,
+                    SEGMENT_BYTES,
+                    SEGMENT_BYTES,
+                    None,
+                )
+                .expect("install source segment");
+            let slot = allocator
+                .claim_value(VALUE_LEN, 1)
+                .pop()
+                .expect("claim source slot");
+            assert!(allocator.mark_prepared_slot_pending_visible(
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            ));
+            assert!(allocator.promote_pending_visible_slot_to_committed(
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            ));
+            allocator
+                .install_committed_manifest(
+                    "source-key",
+                    (7, 1),
+                    slot.allocation_id,
+                    OwnerSlotScope::GlobalShared,
+                    23,
+                )
+                .expect("install source manifest");
+            slot
+        };
+        let requester = OwnerGeneration::new("requester", 19);
+        let operation = OwnerTransferOpId::new(requester, 5, OwnerTransferOpKind::Get);
+        let source_token = OwnerSourceRouteToken {
+            key: "source-key".to_string(),
+            put_id: (7, 1),
+            route_epoch: 23,
+            source: source_slot.clone(),
+            atomic_batch: None,
+            plan_nonce: operation.sequence,
+        };
+        let source_lease = match api
+            .inner()
+            .owner_segment_allocator
+            .lock()
+            .acquire_source(operation.clone(), source_token.clone())
+        {
+            OwnerSegmentTransferOutcome::SourceAcquired { lease_id, .. } => lease_id,
+            other => panic!("expected source lease, got {other:?}"),
+        };
+        assert!(
+            api.inner()
+                .owner_segment_allocator
+                .lock()
+                .release_committed_slot_route(
+                    source_slot.allocation_id,
+                    source_slot.segment_offset,
+                    source_slot.capacity_bytes,
+                )
+        );
+        assert_eq!(
+            api.inner()
+                .owner_segment_allocator
+                .lock()
+                .total_free_bytes(),
+            SEGMENT_BYTES - source_slot.capacity_bytes,
+            "source read lease must block reclaim before WRITE completion"
+        );
+
+        release_owner_get_to_target_source_hold(
+            api.inner(),
+            &operation,
+            &OwnerGetToTargetSourceHold::Memory(source_lease),
+            OwnerTransferOutcome::Success,
+        )
+        .await
+        .expect("release source lease after WRITE completion");
+        assert_eq!(
+            api.inner()
+                .owner_segment_allocator
+                .lock()
+                .total_free_bytes(),
+            SEGMENT_BYTES
+        );
+    }
+}
+
+#[cfg(test)]
+mod owner_put_from_source_singleflight_tests {
+    use super::{OwnerPutFromSourceRequest, OwnerPutFromSourceSharedOp};
+    use crate::owner_segment::{
+        OwnerRouteCommitMode, OwnerSegmentTransferOutcome, OwnerSourceReadCapability,
+        OwnerTargetDisposition, OwnerTargetRouteToken,
+    };
+
+    #[limit_thirdparty::tokio::test]
+    async fn all_followers_reuse_one_put_from_source_terminal() {
+        let op = OwnerPutFromSourceSharedOp::new(OwnerPutFromSourceRequest {
+            ack_stream_id: 1,
+            terminal_sequence: 1,
+            target_attempt: 1,
+            target_plan: OwnerTargetRouteToken::default(),
+            source: OwnerSourceReadCapability::default(),
+            disposition: OwnerTargetDisposition::GlobalShared,
+            route_commit_mode: OwnerRouteCommitMode::Async,
+        });
+        let followers = futures::future::join_all((0..8).map(|_| {
+            let op = op.clone();
+            async move { op.wait().await }
+        }));
+        let expected = OwnerSegmentTransferOutcome::PutFromSourceCompleted {
+            target_attempt: 1,
+            source: Default::default(),
+            target: Default::default(),
+            receipt: Default::default(),
+            route_epoch: 7,
+        };
+        let leader = async {
+            assert!(op.complete(expected.clone()));
+            assert!(!op.complete(OwnerSegmentTransferOutcome::Invalid));
+        };
+        let (followers, ()) = futures::future::join(followers, leader).await;
+        for follower in followers {
+            assert_eq!(follower, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_route_commit_mode_tests {
+    use super::{
+        OwnerPutAppendDoneDisposition, OwnerTargetRouteCommitRequest,
+        OwnerTargetRouteCommitSharedOp, OwnerTargetRouteCommitStart, OwnerTargetRouteCommitWait,
+        classify_owner_put_append_done, owner_put_append_done_is_definitively_rejected,
+        wait_owner_target_route_commit,
+    };
+    use crate::master_kv_router::msg_pack::PutAppendDoneResp;
+    use crate::owner_segment::{
+        OwnerRouteCommitMode, OwnerSegmentTransferOutcome, OwnerTransferErrorCode,
+        OwnerTransferItemError,
+    };
+    use std::time::Duration;
+
+    fn route_flight() -> std::sync::Arc<OwnerTargetRouteCommitSharedOp> {
+        OwnerTargetRouteCommitSharedOp::new(OwnerTargetRouteCommitRequest {
+            lease_id: Default::default(),
+            receipt: Default::default(),
+            route_token: None,
+            route_commit_mode: OwnerRouteCommitMode::Async,
+        })
+    }
+
+    #[test]
+    fn rejected_exact_append_is_an_obsolete_terminal_not_a_retry() {
+        let obsolete = PutAppendDoneResp {
+            appended: false,
+            route_epoch: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_owner_put_append_done(&obsolete),
+            OwnerPutAppendDoneDisposition::Obsolete
+        );
+        let committed = PutAppendDoneResp {
+            appended: true,
+            route_epoch: 91,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_owner_put_append_done(&committed),
+            OwnerPutAppendDoneDisposition::Committed(91)
+        );
+
+        let rejected = crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+            crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidPutMasterState {
+                detail: "append reservation expired".to_string(),
+            },
+        );
+        assert!(owner_put_append_done_is_definitively_rejected(&rejected));
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn async_detaches_while_sync_waits_for_the_same_route_task() {
+        let flight = route_flight();
+        let async_result = ::tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_owner_target_route_commit(
+                OwnerRouteCommitMode::Async,
+                OwnerTargetRouteCommitStart::Running(flight.clone()),
+            ),
+        )
+        .await
+        .expect("Async must not wait for the route terminal");
+        assert!(matches!(async_result, OwnerTargetRouteCommitWait::Detached));
+
+        let sync_wait = wait_owner_target_route_commit(
+            OwnerRouteCommitMode::Sync,
+            OwnerTargetRouteCommitStart::Running(flight.clone()),
+        );
+        ::tokio::pin!(sync_wait);
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(20), &mut sync_wait)
+                .await
+                .is_err(),
+            "Sync must remain blocked before the shared route task is terminal"
+        );
+
+        let terminal = OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+            OwnerTransferErrorCode::RouteCommitRequired,
+            "test route terminal",
+        ));
+        assert!(flight.complete(terminal.clone()));
+        match ::tokio::time::timeout(Duration::from_secs(1), &mut sync_wait)
+            .await
+            .expect("Sync must observe the shared route terminal")
+        {
+            OwnerTargetRouteCommitWait::Terminal(actual) => assert_eq!(actual, terminal),
+            OwnerTargetRouteCommitWait::Detached => panic!("Sync detached its route task"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_put_from_source_integration_tests {
+    use super::{
+        ExternalGetKeySharedOp, ExternalGetKeySharedPhase, ExternalGetStartSharedItemResult,
+    };
+    use crate::client_kv_api::put::{OwnerLocalPublishItem, OwnerLocalPublishJob};
+    use crate::config::OwnerLocalReserveExpectedCapacity;
+    use crate::kvcore_test_lib::{
+        integration_test_lock, start_additional_client_with_config,
+        start_master_and_client_with_client_config, stop_master_and_client,
+    };
+    use crate::master_kv_router::msg_pack::{
+        BatchPreparePutKeyItemReq, PutAtomicGroup, PutAtomicGroupMember,
+    };
+    use crate::master_seg_manager::msg_pack::OwnerPlacementClass;
+    use parking_lot::RwLock;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
+    use std::time::{Duration, Instant};
+
+    #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn remote_replica_uses_one_target_read_and_publishes_exact_bytes() {
+        let _test_guard = integration_test_lock().await;
+        let (master, source) = start_master_and_client_with_client_config(
+            "put_from_source_master",
+            "put_from_source_source",
+            |config| {
+                config.owner_placement_class = Some(OwnerPlacementClass::Inference);
+                config.replica_writeback_hot_capacity_ratio = Some(0.5);
+                config
+                    .test_spec_config
+                    .owner_local_reserve_expected_capacity =
+                    Some(OwnerLocalReserveExpectedCapacity {
+                        value_len: 4096,
+                        payload_capacity_bytes: config.contribute_to_cluster_pool_size.dram / 2,
+                    });
+            },
+        )
+        .await;
+        let target = start_additional_client_with_config(
+            "put_from_source_master",
+            "put_from_source_target",
+            |config| {
+                config.owner_placement_class = Some(OwnerPlacementClass::RemoteCpu);
+                config.replica_writeback_hot_capacity_ratio = None;
+                config.fluxonkv_spec.sub_cluster = Some("remote_cache".to_string());
+                config
+                    .test_spec_config
+                    .owner_local_reserve_expected_capacity = None;
+            },
+        )
+        .await;
+
+        let key = "put_from_source_exact_bytes";
+        let payload = vec![0x6du8; 4096];
+        let source_view = source.client_kv_api_view();
+        let source_inner = source_view.client_kv_api().inner();
+        let target_view = target.client_kv_api_view();
+        let target_inner = target_view.client_kv_api().inner();
+        let blocked_get = Arc::new(ExternalGetKeySharedOp::new(key.to_string()));
+        {
+            let mut controls = target_inner.owner_key_control.lock_key(key);
+            controls.entry(key.to_string()).or_default().external_get = Some(blocked_get.clone());
+        }
+        target_inner.track_external_get_flight(&blocked_get);
+        let target_node: crate::cluster_manager::NodeID = target
+            .cluster_manager_view()
+            .cluster_manager()
+            .get_self_info()
+            .id
+            .into();
+        let source_node: crate::cluster_manager::NodeID = source
+            .cluster_manager_view()
+            .cluster_manager()
+            .get_self_info()
+            .id
+            .into();
+        let master_view = master.master_kv_router_view();
+        let registration_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let source_ready = master_view
+                .master_seg_manager()
+                .get_node_registered_segments(&source_node)
+                .is_some_and(|segments| !segments.is_empty());
+            let target_ready = master_view
+                .master_seg_manager()
+                .get_node_registered_segments(&target_node)
+                .is_some_and(|segments| !segments.is_empty());
+            if source_ready && target_ready {
+                break;
+            }
+            assert!(
+                Instant::now() < registration_deadline,
+                "source/target segment registration did not converge: source_ready={} target_ready={}",
+                source_ready,
+                target_ready,
+            );
+            limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        super::local_reserve_rebalance::publish_owner_capacity_report(&target_view)
+            .await
+            .expect("target owner capacity report RPC must converge after registration");
+        let expected_allocation_size =
+            crate::owner_segment_allocation_capacity_bytes(payload.len() as u64)
+                .expect("test payload must fit the owner allocator");
+        loop {
+            let target_capacity_ready = master_view
+                .master_seg_manager()
+                .get_owner_capacity_report(target_node.as_ref())
+                .is_some_and(|(report, _age)| {
+                    report.settled
+                        && report.size_classes.iter().any(|size_class| {
+                            size_class.allocation_size_bytes == expected_allocation_size
+                                && size_class.allocatable_bytes >= expected_allocation_size
+                        })
+                });
+            if target_capacity_ready {
+                break;
+            }
+            assert!(
+                Instant::now() < registration_deadline,
+                "target owner capacity report did not converge for allocation_size={}",
+                expected_allocation_size,
+            );
+            limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let prepared = source_inner
+            .batch_prepare_put_keys(vec![BatchPreparePutKeyItemReq {
+                key: key.to_string(),
+                reject_if_inflight_same_key: false,
+                reject_if_exist_same_key: false,
+            }])
+            .await
+            .expect("reserve owner-local source key");
+        assert_eq!(prepared.reservation_ids.len(), 1);
+        let slot_lease = source_inner
+            .owner_claim_local_reserve_slot_lease(payload.len() as u64, 1)
+            .await
+            .expect("claim owner-local source slot");
+        let source_slot = slot_lease.slots[0].clone();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                source_slot.addr as *mut u8,
+                payload.len(),
+            );
+        }
+        let put_id = source_inner.next_owner_local_first_put_id();
+        let memory_info = source_inner
+            .build_local_reserve_resident_memory_info(
+                key,
+                source_slot.addr,
+                payload.len() as u32,
+                source_slot.allocation_id,
+                source_slot.segment_offset,
+                source_slot.capacity_bytes,
+            )
+            .await;
+        source_inner.install_precommit_local_visible_memory_info(key, memory_info);
+        source_inner
+            .enqueue_owner_local_publish(OwnerLocalPublishJob {
+                items: vec![OwnerLocalPublishItem {
+                    key: key.to_string(),
+                    put_id,
+                    value_len: payload.len() as u64,
+                    lease_id: None,
+                    committed_slot: source_slot,
+                    make_replica_task: true,
+                    remote_replica_admitted: true,
+                    preferred_sub_cluster: None,
+                    atomic_group: None,
+                    radix: None,
+                }],
+                key_reservation_ids: prepared.reservation_ids,
+                external_pending_contexts: Vec::new(),
+            })
+            .await
+            .expect("enqueue owner-local source publication");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let published_put_id = loop {
+            if let Some(route) = master_view
+                .master_kv_router()
+                .inner()
+                .kv_routes
+                .get(key)
+                .map(|route| route.clone())
+            {
+                break route.put_id;
+            }
+            assert!(Instant::now() < deadline, "source route was not published");
+            limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(published_put_id, put_id);
+        let target_flight = loop {
+            if let Some(flight) = target_inner
+                .owner_put_from_source_flights
+                .iter()
+                .next()
+                .map(|entry| entry.value().clone())
+            {
+                break flight;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PutFromSource Async target flight was not installed"
+            );
+            let _ = source_inner
+                .ensure_remote_put(key, put_id, None, true)
+                .await
+                .expect("joining the exact remote Put flight must not fail");
+            limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            target_inner.runtime_observe_snapshot().remote_put_transfers,
+            0,
+            "PutFromSource must not transfer while planned Get owns the key flight"
+        );
+        assert!(
+            target_inner
+                .owner_segment_allocator
+                .lock()
+                .manifest_entry(key, put_id)
+                .is_none(),
+            "PutFromSource must not install a second target manifest behind Get"
+        );
+        {
+            let mut controls = target_inner.owner_key_control.lock_key(key);
+            let mut get_state = blocked_get.state.lock();
+            get_state.phase = ExternalGetKeySharedPhase::Ready {
+                result: ExternalGetStartSharedItemResult::Miss,
+            };
+            get_state.terminal_at = Some(Instant::now());
+            let remove_control = if let Some(control) = controls.get_mut(key) {
+                assert!(
+                    control
+                        .external_get
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &blocked_get))
+                );
+                control.external_get = None;
+                control.is_idle()
+            } else {
+                false
+            };
+            if remove_control {
+                controls.remove(key);
+            }
+        }
+        target_inner.untrack_external_get_flight(&blocked_get);
+        blocked_get.notify.notify_waiters();
+        let accepted = ::tokio::time::timeout(Duration::from_secs(5), target_flight.wait())
+            .await
+            .expect("Async PutFromSource must publish its outward terminal");
+        assert!(matches!(
+            &accepted,
+            crate::owner_segment::OwnerSegmentTransferOutcome::PutFromSourceAcceptedRoutePending { .. }
+        ));
+        loop {
+            let target_published = master_view
+                .master_kv_router()
+                .inner()
+                .kv_routes
+                .get(key)
+                .is_some_and(|route| {
+                    route
+                        .node_replicas
+                        .read()
+                        .get(&target_node)
+                        .is_some_and(|replicas| {
+                            !replicas.tomb_tag.is_tomb()
+                                && replicas.memory.as_ref().is_some_and(|memory| {
+                                    matches!(
+                                        &memory.backing,
+                                        crate::master_kv_router::KvReplicaBacking::CommittedSlot(
+                                            slot
+                                        ) if slot.owner.node_id.as_str() == target_node.as_ref()
+                                    )
+                                })
+                        })
+                });
+            if target_published {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PutFromSource did not publish the target route"
+            );
+            let _ = source_inner
+                .ensure_remote_put(key, put_id, None, true)
+                .await
+                .expect("joining the exact remote Put flight must not fail");
+            limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            target_inner.runtime_observe_snapshot().remote_put_transfers,
+            1,
+            "one target attempt must issue exactly one target-side READ"
+        );
+        assert_eq!(
+            target_inner.owner_put_from_source_flights.len(),
+            1,
+            "retries and the explicit waiter must reuse one target flight"
+        );
+        assert_eq!(
+            target_flight.wait().await,
+            accepted,
+            "a replay after background commit must retain the original Async outward terminal"
+        );
+        let route_flight = target_inner
+            .owner_target_route_commit_flights
+            .iter()
+            .next()
+            .map(|entry| entry.value().clone())
+            .expect("Async PutFromSource must install one route task");
+        assert!(matches!(
+            route_flight.wait().await,
+            crate::owner_segment::OwnerSegmentTransferOutcome::TargetCommitted {
+                route_epoch,
+                ..
+            } if route_epoch != 0
+        ));
+        let target_manifest = target_inner
+            .owner_segment_allocator
+            .lock()
+            .manifest_entry(key, put_id)
+            .expect("target owner manifest must contain the committed replica");
+        assert_eq!(
+            target_manifest.physical_state,
+            crate::owner_segment::OwnerSlotPhysicalState::Committed
+        );
+        assert_eq!(target_manifest.slot.len, payload.len() as u64);
+        let target_bytes = unsafe {
+            std::slice::from_raw_parts(
+                target_manifest.slot.addr as *const u8,
+                target_manifest.slot.len as usize,
+            )
+        };
+        assert_eq!(target_bytes, payload.as_slice());
+
+        // Reproduce the inference workload's dense atomic_batch: all members
+        // publish locally first, then independently enter the common remote
+        // Put singleflight and commit concurrently at one RemoteCpu-like
+        // target. This catches token/item swaps that a one-key test cannot.
+        let batch_keys = (0..13)
+            .map(|index| format!("put_from_source_atomic_{index}"))
+            .collect::<Vec<_>>();
+        let prepared = source_inner
+            .batch_prepare_put_keys(
+                batch_keys
+                    .iter()
+                    .map(|key| BatchPreparePutKeyItemReq {
+                        key: key.clone(),
+                        reject_if_inflight_same_key: false,
+                        reject_if_exist_same_key: false,
+                    })
+                    .collect(),
+            )
+            .await
+            .expect("reserve atomic owner-local source keys");
+        assert_eq!(prepared.reservation_ids.len(), batch_keys.len());
+        let batch_slots = source_inner
+            .owner_claim_local_reserve_slot_lease(payload.len() as u64, batch_keys.len())
+            .await
+            .expect("claim atomic owner-local source slots")
+            .slots;
+        let batch_put_ids = batch_keys
+            .iter()
+            .map(|_| source_inner.next_owner_local_first_put_id())
+            .collect::<Vec<_>>();
+        let atomic_group = PutAtomicGroup {
+            members: batch_keys
+                .iter()
+                .zip(&batch_put_ids)
+                .map(|(key, put_id)| PutAtomicGroupMember {
+                    key: key.clone(),
+                    put_id: *put_id,
+                })
+                .collect(),
+        };
+        let blocked_atomic_key = batch_keys[0].clone();
+        let blocked_atomic_get = Arc::new(ExternalGetKeySharedOp::new(blocked_atomic_key.clone()));
+        {
+            let mut controls = target_inner.owner_key_control.lock_key(&blocked_atomic_key);
+            controls
+                .entry(blocked_atomic_key.clone())
+                .or_default()
+                .external_get = Some(blocked_atomic_get.clone());
+        }
+        target_inner.track_external_get_flight(&blocked_atomic_get);
+        let mut publish_items = Vec::with_capacity(batch_keys.len());
+        for (((key, put_id), slot), fill) in batch_keys
+            .iter()
+            .zip(&batch_put_ids)
+            .zip(batch_slots)
+            .zip(0x70u8..)
+        {
+            unsafe {
+                std::ptr::write_bytes(slot.addr as *mut u8, fill, payload.len());
+            }
+            let memory_info = source_inner
+                .build_local_reserve_resident_memory_info(
+                    key,
+                    slot.addr,
+                    payload.len() as u32,
+                    slot.allocation_id,
+                    slot.segment_offset,
+                    slot.capacity_bytes,
+                )
+                .await;
+            source_inner.install_precommit_local_visible_memory_info(key, memory_info);
+            publish_items.push(OwnerLocalPublishItem {
+                key: key.clone(),
+                put_id: *put_id,
+                value_len: payload.len() as u64,
+                lease_id: None,
+                committed_slot: slot,
+                make_replica_task: true,
+                remote_replica_admitted: true,
+                preferred_sub_cluster: None,
+                atomic_group: Some(atomic_group.clone()),
+                radix: None,
+            });
+        }
+        source_inner
+            .enqueue_owner_local_publish(OwnerLocalPublishJob {
+                items: publish_items,
+                key_reservation_ids: prepared.reservation_ids,
+                external_pending_contexts: Vec::new(),
+            })
+            .await
+            .expect("enqueue atomic owner-local source publication");
+
+        let atomic_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let target_waiting = target_inner
+                .owner_put_from_source_flights
+                .iter()
+                .any(|entry| entry.value().request.target_plan.key == blocked_atomic_key);
+            let inflight_reserved = master_view
+                .master_kv_router()
+                .inner()
+                .inflight_replica_tasks
+                .get(&(
+                    blocked_atomic_key.clone(),
+                    batch_put_ids[0].0,
+                    batch_put_ids[0].1,
+                ))
+                .await
+                .is_some();
+            if target_waiting && inflight_reserved {
+                break;
+            }
+            assert!(
+                Instant::now() < atomic_deadline,
+                "blocked atomic PutFromSource did not reserve its immutable master operation"
+            );
+            limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Reproduce the a6 race: a replay arrives after the route visible at
+        // Start has changed. The replay must reuse the reservation's frozen
+        // atomic_batch, never rebuild its token from the later route object.
+        let original_route = master_view
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .get(&blocked_atomic_key)
+            .map(|entry| entry.value().clone())
+            .expect("blocked atomic source route must be visible");
+        let drifted_route = Arc::new(crate::master_kv_router::OneKvNodesRoutes {
+            put_id: original_route.put_id,
+            radix: original_route.radix.clone(),
+            lease_id: original_route.lease_id,
+            atomic_group: None,
+            node_replicas: RwLock::new(original_route.node_replicas.read().clone()),
+            get_durable_slots_used: AtomicU32::new(
+                original_route
+                    .get_durable_slots_used
+                    .load(Ordering::Acquire),
+            ),
+        });
+        master_view
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .insert(blocked_atomic_key.clone(), drifted_route);
+        let replay_plan = source_inner
+            .put_append_start(
+                &blocked_atomic_key,
+                batch_put_ids[0],
+                payload.len() as u32,
+                None,
+                true,
+            )
+            .await
+            .expect("replica Start replay must reuse the reserved operation");
+        assert_eq!(
+            replay_plan.owner_candidates[0].atomic_batch.as_ref(),
+            Some(&atomic_group),
+            "Start replay rebuilt atomic_batch from a later route instead of the inflight reservation"
+        );
+        master_view
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .insert(blocked_atomic_key.clone(), original_route);
+        {
+            let mut controls = target_inner.owner_key_control.lock_key(&blocked_atomic_key);
+            let mut get_state = blocked_atomic_get.state.lock();
+            get_state.phase = ExternalGetKeySharedPhase::Ready {
+                result: ExternalGetStartSharedItemResult::Miss,
+            };
+            get_state.terminal_at = Some(Instant::now());
+            let remove_control = if let Some(control) = controls.get_mut(&blocked_atomic_key) {
+                control.external_get = None;
+                control.is_idle()
+            } else {
+                false
+            };
+            if remove_control {
+                controls.remove(&blocked_atomic_key);
+            }
+        }
+        target_inner.untrack_external_get_flight(&blocked_atomic_get);
+        blocked_atomic_get.notify.notify_waiters();
+
+        loop {
+            let published = batch_keys.iter().zip(&batch_put_ids).all(|(key, put_id)| {
+                master_view
+                    .master_kv_router()
+                    .inner()
+                    .kv_routes
+                    .get(key)
+                    .is_some_and(|route| {
+                        route.put_id == *put_id
+                            && route.node_replicas.read().get(&target_node).is_some_and(
+                                |replicas| {
+                                    !replicas.tomb_tag.is_tomb()
+                                        && replicas.memory.as_ref().is_some_and(|memory| {
+                                            matches!(
+                                                memory.backing,
+                                                crate::master_kv_router::KvReplicaBacking::CommittedSlot(_)
+                                            )
+                                        })
+                                },
+                            )
+                    })
+            });
+            if published {
+                break;
+            }
+            assert!(
+                Instant::now() < atomic_deadline,
+                "atomic PutFromSource routes did not all commit"
+            );
+            limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        target.shutdown().await.expect("stop target owner");
+        stop_master_and_client(master, source).await;
     }
 }
 
@@ -474,11 +1587,13 @@ pub enum ExternalGetKeySharedPhase {
     Starting,
     Started {
         item: BatchGetStartItemResp,
+        late_target: Option<GetBindTarget>,
     },
     /// At least one request plan's prefix retained this key.  The leader atomic_batch is
     /// transferring/completing it and later publishes one canonical result.
     Finishing {
         item: BatchGetStartItemResp,
+        late_target: Option<GetBindTarget>,
     },
     /// No request plan's prefix retained this prepared Get.  Keep the marker in
     /// the owner key fence until BatchGetRevoke and local-slot release finish,
@@ -527,6 +1642,28 @@ impl ExternalGetKeySharedOp {
                 terminal_at: None,
             }),
             notify: Arc::new(limit_thirdparty::tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(crate) async fn wait_terminal(&self) {
+        loop {
+            let notified = self.notify.notified();
+            futures::pin_mut!(notified);
+            let should_wait = {
+                let state = self.state.lock();
+                match state.phase {
+                    ExternalGetKeySharedPhase::Ready { .. }
+                    | ExternalGetKeySharedPhase::Failed { .. } => false,
+                    _ => {
+                        notified.as_mut().enable();
+                        true
+                    }
+                }
+            };
+            if !should_wait {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -1200,20 +2337,6 @@ async fn handle_external_put_revoke(
     }
 }
 
-async fn handle_ssd_stage_read(
-    view: &ClientKvApiView,
-    msg: &MsgPack<SsdStageReadReq>,
-) -> MsgPack<SsdStageReadResp> {
-    MsgPack {
-        serialize_part: view
-            .client_kv_api()
-            .inner()
-            .execute_ssd_stage(&msg.serialize_part)
-            .await,
-        raw_bytes: Vec::new(),
-    }
-}
-
 async fn handle_external_delete_ack(
     view: &ClientKvApiView,
     msg: &MsgPack<ExternalDeleteAckReq>,
@@ -1627,6 +2750,7 @@ pub struct ClientKvApiNewArg {
     /// continues to enforce the smaller logical hot-tier capacity.
     pub owner_local_reserve_physical_capacity_bytes: u64,
     pub allocation_authority: crate::master_seg_manager::msg_pack::SegmentAllocationAuthority,
+    pub owner_placement_class: crate::master_seg_manager::msg_pack::OwnerPlacementClass,
     pub ssd_storage: Option<KvSsdStorageInit>,
 }
 
@@ -1650,6 +2774,7 @@ pub(crate) struct PendingLocalGetInfo {
     put_id: crate::master_kv_router::put::PutIDForAKey,
     mem_holder: Arc<MemoryInfo>,
     source: PendingLocalGetSource,
+    target_write_capability: Option<crate::owner_segment::OwnerTargetWriteCapability>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1983,13 +3108,29 @@ pub(crate) enum OwnerHotEvictionDispatch {
     },
     EndPressure {
         selected_bytes: u64,
+        /// GlobalShared logical headroom observed before this pressure batch
+        /// popped LocalExclusive entries.  The dispatcher combines this with
+        /// only the victims that actually acquired an exact source fence;
+        /// metadata-only candidates never become projected physical credit.
+        global_headroom_before: u64,
         /// The pressure producer must not select another Moka batch until
         /// this batch has finished source fencing, master direct-delete, and
         /// owner slot-release handling.  Candidate debt before that point is
-        /// deliberately not projected reclaim credit.
-        completion: ::tokio::sync::oneshot::Sender<()>,
+        /// deliberately not projected reclaim credit.  The dispatcher
+        /// returns both the requested bytes and the bytes actually selected
+        /// from the master's GlobalShared Moka for observability only.  A
+        /// selected candidate, retry-only debt or source fence never closes
+        /// owner pressure; only the owner allocator's exact Free/claim state
+        /// does.
+        completion: ::tokio::sync::oneshot::Sender<OwnerPressureBatchReclaim>,
     },
     Flush,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OwnerPressureBatchReclaim {
+    pub requested_bytes: u64,
+    pub selected_bytes: u64,
 }
 
 pub(crate) enum OwnerHotEvictionPreparation {
@@ -2446,10 +3587,88 @@ impl ExternalPutKeySharedOp {
 pub(crate) enum ExternalLocalFirstPutKeyReservation {
     Leader(Arc<ExternalPendingPutFenceGuard>),
     Wait(Arc<ExternalPutKeySharedOp>),
+    /// An incoming PutFromSource or a detached Get CommitTarget already owns
+    /// the canonical owner-slot materialization for this key.  A reusable
+    /// local-first Put waits without claiming a slot, then re-evaluates its
+    /// complete atomic_batch after that materialization reaches terminal.
+    WaitForMaterialization(Arc<OwnerKeyMaterializationOp>),
+    /// A Get for the same owner-local key won the per-key fence first.  The
+    /// Put must not claim a second destination while that Get is materializing
+    /// its canonical local result.  The caller drops every partial
+    /// `atomic_batch` reservation, waits asynchronously, then re-evaluates the
+    /// whole batch under the same key fences.
+    WaitForGet(Arc<ExternalGetKeySharedOp>),
     /// A committed owner-local source is between precise source selection and
     /// reclaim completion/rollback.  The caller owns only a watch receiver:
     /// it holds no key fence or physical slot while asynchronously waiting to
     /// re-evaluate the complete atomic_batch.
+    WaitForLocalAccess(watch::Receiver<bool>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerKeyMaterializationOutcome {
+    InFlight,
+    Committed,
+    Failed,
+}
+
+/// One physical owner-slot materialization for a key generation.
+///
+/// This is deliberately a small cross-operation fence rather than another
+/// transfer state machine.  Planned Get and incoming PutFromSource keep their
+/// existing operation identities and replay tables; this watch only elects
+/// which operation may allocate/transfer and lets the loser reuse the
+/// winner's committed owner manifest.
+pub(crate) struct OwnerKeyMaterializationOp {
+    pub key: String,
+    pub put_id: crate::master_kv_router::put::PutIDForAKey,
+    outcome: watch::Sender<OwnerKeyMaterializationOutcome>,
+    completed: AtomicBool,
+}
+
+impl OwnerKeyMaterializationOp {
+    fn new(key: &str, put_id: crate::master_kv_router::put::PutIDForAKey) -> Arc<Self> {
+        let (outcome, _receiver) = watch::channel(OwnerKeyMaterializationOutcome::InFlight);
+        Arc::new(Self {
+            key: key.to_string(),
+            put_id,
+            outcome,
+            completed: AtomicBool::new(false),
+        })
+    }
+
+    fn complete(&self, outcome: OwnerKeyMaterializationOutcome) -> bool {
+        debug_assert_ne!(outcome, OwnerKeyMaterializationOutcome::InFlight);
+        if self
+            .completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.outcome.send_replace(outcome);
+        true
+    }
+
+    pub(crate) async fn wait(&self) -> OwnerKeyMaterializationOutcome {
+        let mut outcome = self.outcome.subscribe();
+        loop {
+            let current = *outcome.borrow_and_update();
+            if current != OwnerKeyMaterializationOutcome::InFlight {
+                return current;
+            }
+            if outcome.changed().await.is_err() {
+                return OwnerKeyMaterializationOutcome::Failed;
+            }
+        }
+    }
+}
+
+pub(crate) enum OwnerKeyMaterializationReservation {
+    Leader(Arc<OwnerKeyMaterializationOp>),
+    Wait(Arc<OwnerKeyMaterializationOp>),
+    WaitForGet(Arc<ExternalGetKeySharedOp>),
+    WaitForExternalPut(Arc<ExternalPutKeySharedOp>),
     WaitForLocalAccess(watch::Receiver<bool>),
 }
 
@@ -2481,6 +3700,10 @@ pub(crate) struct OwnerKeyControlState {
     /// the same fence as local visibility and reclaim so `R ∩ local`,
     /// `R ∩ inflight`, and new leaders are classified atomically.
     external_get: Option<Arc<ExternalGetKeySharedOp>>,
+    /// Cross-operation slot materialization fence.  The operation-specific
+    /// Get/Put state machines remain authoritative; this marker only prevents
+    /// them from allocating and transferring the same key generation twice.
+    owner_materialization: Option<Arc<OwnerKeyMaterializationOp>>,
     /// Completion channel for the exact source-selection/reclaim fence.  A
     /// receiver subscribed under the key-shard lock cannot miss completion,
     /// even if the fence clears before the waiter is first polled.
@@ -2501,6 +3724,7 @@ impl OwnerKeyControlState {
             && self.source_eviction_selection.is_none()
             && self.reclaim.is_none()
             && self.external_get.is_none()
+            && self.owner_materialization.is_none()
             && self.local_access_fence.is_none()
     }
 
@@ -2589,6 +3813,46 @@ impl OwnerKeyControlTable {
         key: &str,
     ) -> parking_lot::MutexGuard<'_, HashMap<String, OwnerKeyControlState>> {
         self.shards[Self::shard_index(key)].lock()
+    }
+}
+
+pub(crate) struct OwnerKeyMaterializationGuard {
+    view: ClientKvApiView,
+    op: Arc<OwnerKeyMaterializationOp>,
+    finished: bool,
+}
+
+impl OwnerKeyMaterializationGuard {
+    fn new(view: ClientKvApiView, op: Arc<OwnerKeyMaterializationOp>) -> Self {
+        Self {
+            view,
+            op,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(&mut self, outcome: OwnerKeyMaterializationOutcome) {
+        if self.finished {
+            return;
+        }
+        self.view
+            .client_kv_api()
+            .inner()
+            .finish_owner_key_materialization(&self.op, outcome);
+        self.finished = true;
+    }
+}
+
+impl Drop for OwnerKeyMaterializationGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.view
+            .client_kv_api()
+            .inner()
+            .finish_owner_key_materialization(&self.op, OwnerKeyMaterializationOutcome::Failed);
+        self.finished = true;
     }
 }
 
@@ -2990,6 +4254,7 @@ pub struct ClientKvApiInner {
     test_spec_config: TestSpecConfig,
     owner_local_reserve_physical_capacity_bytes: u64,
     allocation_authority: crate::master_seg_manager::msg_pack::SegmentAllocationAuthority,
+    owner_placement_class: crate::master_seg_manager::msg_pack::OwnerPlacementClass,
     ssd_storage: Option<Arc<KvSsdStorage>>,
     metrics: OnceLock<Arc<MetricsHandle>>,
 
@@ -3001,7 +4266,10 @@ pub struct ClientKvApiInner {
     /// key -> locally readable resident slot before backend put_start/put_done finishes.
     precommit_local_visible_info: DashMap<String, PrecommitLocalVisibleInfo>,
     /// Transferred Get targets awaiting an idempotent master GetDone result.
-    /// These entries fence reclaim but are never visible to readers.
+    /// The payload is already DataReady/RoutePending, so external local probes
+    /// may reuse its exact `MemoryInfo` under the per-key fence.  It is still
+    /// excluded from the committed local index and from Moka hot-touch until
+    /// the master terminal promotes it.
     pending_local_get_info: DashMap<String, PendingLocalGetInfo>,
     /// key -> local replica version remembered from local put/get durable-replica success.
     /// This authority is positive-only: hit means "can answer exists=true immediately when
@@ -3065,6 +4333,25 @@ pub struct ClientKvApiInner {
     /// Exact `get_id` SSD source operations. RPC retransmits and concurrent
     /// callers join one disk read plus one payload transfer.
     ssd_stage_flights: DashMap<u64, Arc<SsdStageSharedOp>>,
+    /// Exact source-side Get operations. One leader performs the WRITE;
+    /// followers and transport retries reuse the same terminal.
+    owner_get_to_target_flights:
+        DashMap<crate::owner_segment::OwnerTransferOpId, Arc<OwnerGetToTargetSharedOp>>,
+    /// Exact target attempt -> one detached target-side READ/route terminal.
+    owner_put_from_source_flights:
+        DashMap<(crate::owner_segment::OwnerTransferOpId, u32), Arc<OwnerPutFromSourceSharedOp>>,
+    /// DataReady target -> one detached metadata route task. Async callers
+    /// return after this entry and its task guard exist; Sync callers await
+    /// the same terminal.
+    owner_target_route_commit_flights:
+        DashMap<crate::owner_segment::OwnerTransferOpId, Arc<OwnerTargetRouteCommitSharedOp>>,
+    /// Outbound terminal sequence/ACK state. ACKs are piggybacked on the next
+    /// owner batch and never add a foreground control-plane round trip.
+    owner_transfer_peer_tracker: OwnerTransferPeerTracker,
+    /// Monotonic ACK watermark received from each caller generation/stream.
+    /// It rejects late duplicate operations after their full terminal was GC'd.
+    owner_transfer_inbound_ack_watermarks:
+        DashMap<(crate::owner_segment::OwnerGeneration, u64), u64>,
     /// Short-lived terminal replay closes the active-map removal race and
     /// prevents a lost response from re-reading or re-transferring the value.
     completed_ssd_stages: moka::future::Cache<u64, CompletedSsdStage>,
@@ -3112,13 +4399,15 @@ pub struct ClientKvApiInner {
     rpc_caller_get_meta: RPCCaller<GetMetaReq>,
     rpc_caller_allocate_client_lease: RPCCaller<AllocateClientLeaseReq>,
     rpc_caller_client_lease_keepalive: RPCCaller<ClientLeaseKeepaliveReq>,
-    rpc_caller_ssd_stage_read: RPCCaller<SsdStageReadReq>,
     rpc_caller_ssd_stage_begin: RPCCaller<SsdStageBeginReq>,
     rpc_caller_ssd_stage_done: RPCCaller<SsdStageDoneReq>,
     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
     rpc_caller_external_put_revoke: RPCCaller<ExternalPutRevokeReq>,
     rpc_caller_resolve_side_transfer_lane: RPCCaller<ResolveSideTransferLaneReq>,
     rpc_caller_owner_segment_transfer: RPCCaller<OwnerSegmentTransferReq>,
+    rpc_caller_owner_capacity_report:
+        RPCCaller<crate::master_seg_manager::msg_pack::OwnerCapacityReportReq>,
+    owner_capacity_report_epoch: AtomicU64,
 
     /// Default lease id recorded for inspection/convenience, but NOT auto-applied.
     /// Callers must explicitly pass `Some(lease_id)` to attach a put to a lease.
@@ -3484,109 +4773,6 @@ impl ClientKvApiInner {
             });
         }
         op.wait().await
-    }
-
-    pub(crate) async fn stage_kv_from_ssd_source(
-        &self,
-        source_node_id: &NodeIDString,
-        key: &str,
-        put_id: crate::master_kv_router::put::PutIDForAKey,
-        get_id: u64,
-        stage_addr: u64,
-        stage_capacity: u64,
-        target_addr: u64,
-        len: u64,
-    ) -> KvResult<()> {
-        let req = SsdStageReadReq {
-            key: key.to_string(),
-            put_id,
-            get_id,
-            stage_addr,
-            stage_capacity,
-            len,
-        };
-        let self_node_id = self.view.cluster_manager().get_self_info().id.clone();
-        self.ssd_stage_counters
-            .source_ready_wait_requests
-            .fetch_add(1, Ordering::Relaxed);
-        let ready_wait_started_at = Instant::now();
-        let response_result: KvResult<SsdStageReadResp> = if source_node_id == &self_node_id {
-            Ok(self.execute_ssd_stage(&req).await)
-        } else {
-            self.rpc_caller_ssd_stage_read
-                .call_with_transport_policy(
-                    self.view.p2p_module(),
-                    source_node_id.clone().into(),
-                    MsgPack {
-                        serialize_part: req,
-                        raw_bytes: Vec::new(),
-                    },
-                    Some(SSD_STAGE_RPC_TIMEOUT),
-                    RpcTransportPolicy::ForceTransport,
-                    1,
-                )
-                .await
-                .map(|response| response.serialize_part)
-                .map_err(KvError::from)
-        };
-        self.ssd_stage_counters
-            .source_ready_wait_duration_us
-            .fetch_add(
-                u64::try_from(ready_wait_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-        let ready_result = response_result.and_then(|response| {
-            crate::rpcresp_kvresult_convert::try_from_code(response.error_code, response.error_json)
-        });
-        if ready_result.is_ok() {
-            self.ssd_stage_counters
-                .source_ready_wait_successes
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.ssd_stage_counters
-                .source_ready_wait_failures
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        ready_result?;
-
-        self.ssd_stage_counters
-            .target_pull_requests
-            .fetch_add(1, Ordering::Relaxed);
-        let pull_started_at = Instant::now();
-        let peer_id = (source_node_id != &self_node_id).then(|| source_node_id.clone());
-        let transfer_result = self
-            .view
-            .client_transfer_engine()
-            .transfer_data_no_copy(peer_id, true, stage_addr, target_addr, len, None)
-            .await
-            .map(|_| ())
-            .map_err(|err| {
-                KvError::Api(ApiError::Transfer {
-                    from_addr: stage_addr,
-                    to_addr: target_addr,
-                    len,
-                    error: err.to_string(),
-                })
-            });
-        self.ssd_stage_counters.target_pull_duration_us.fetch_add(
-            u64::try_from(pull_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        if transfer_result.is_ok() {
-            self.ssd_stage_counters
-                .target_pull_successes
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.ssd_stage_counters
-                .target_pull_failures
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Payload completion is the ownership hand-off point: the target no
-        // longer reads the source stage, so master may release it. Do not put
-        // this control-plane ACK on the foreground Get latency path.
-        self.finish_ssd_stage_detached(get_id);
-        transfer_result
     }
 
     pub(crate) fn kv_ssd_storage_usage_snapshot(
@@ -3957,6 +5143,93 @@ impl ClientKvApiInner {
         })
     }
 
+    pub(crate) fn reserve_owner_key_materialization(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+    ) -> OwnerKeyMaterializationReservation {
+        let mut controls = self.owner_key_control.lock_key(key);
+        if let Some(state) = controls.get(key) {
+            if state.local_access_fenced() {
+                return OwnerKeyMaterializationReservation::WaitForLocalAccess(
+                    state.subscribe_local_access_fence(),
+                );
+            }
+            if let Some(op) = state.owner_materialization.clone() {
+                if op.put_id != put_id {
+                    tracing::debug!(
+                        key,
+                        active_put_time_ms = op.put_id.0,
+                        active_put_version = op.put_id.1,
+                        waiting_put_time_ms = put_id.0,
+                        waiting_put_version = put_id.1,
+                        "serializing different key generations behind one owner materialization"
+                    );
+                }
+                return OwnerKeyMaterializationReservation::Wait(op);
+            }
+            if let Some(op) = state.external_get.clone() {
+                return OwnerKeyMaterializationReservation::WaitForGet(op);
+            }
+            if let Some(op) = state.external_put.clone() {
+                return OwnerKeyMaterializationReservation::WaitForExternalPut(op);
+            }
+        }
+        let op = OwnerKeyMaterializationOp::new(key, put_id);
+        let state = controls.entry(key.to_string()).or_default();
+        assert!(state.owner_materialization.replace(op.clone()).is_none());
+        OwnerKeyMaterializationReservation::Leader(op)
+    }
+
+    /// Extend a Get's existing per-key admission fence through its detached
+    /// Async CommitTarget task.  If another materialization somehow already
+    /// exists, the caller must keep this Get on the synchronous Done path;
+    /// silently joining after it already transferred would retain two slots.
+    pub(crate) fn begin_async_get_key_materialization(
+        &self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+    ) -> Option<OwnerKeyMaterializationGuard> {
+        let mut controls = self.owner_key_control.lock_key(key);
+        let state = controls.entry(key.to_string()).or_default();
+        if state.owner_materialization.is_some() || state.external_put.is_some() {
+            return None;
+        }
+        let op = OwnerKeyMaterializationOp::new(key, put_id);
+        state.owner_materialization = Some(op.clone());
+        Some(OwnerKeyMaterializationGuard::new(
+            self.view.clone_view(),
+            op,
+        ))
+    }
+
+    pub(crate) fn finish_owner_key_materialization(
+        &self,
+        op: &Arc<OwnerKeyMaterializationOp>,
+        outcome: OwnerKeyMaterializationOutcome,
+    ) -> bool {
+        if !op.complete(outcome) {
+            return false;
+        }
+        let mut controls = self.owner_key_control.lock_key(&op.key);
+        let remove_control = if let Some(state) = controls.get_mut(&op.key) {
+            if state
+                .owner_materialization
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, op))
+            {
+                state.owner_materialization = None;
+            }
+            state.is_idle()
+        } else {
+            false
+        };
+        if remove_control {
+            controls.remove(&op.key);
+        }
+        true
+    }
+
     pub(crate) fn reserve_external_local_first_put_key(
         &self,
         key: &str,
@@ -3989,6 +5262,26 @@ impl ClientKvApiInner {
             }));
         }
         let state = controls.entry(key.to_string()).or_default();
+        if let Some(op) = state.owner_materialization.clone() {
+            return if reusable_singleflight {
+                Ok(ExternalLocalFirstPutKeyReservation::WaitForMaterialization(
+                    op,
+                ))
+            } else {
+                Err(KvError::Api(ApiError::KeyBeingWritten {
+                    key: key.to_string(),
+                }))
+            };
+        }
+        if let Some(op) = state.external_get.clone() {
+            return if reusable_singleflight {
+                Ok(ExternalLocalFirstPutKeyReservation::WaitForGet(op))
+            } else {
+                Err(KvError::Api(ApiError::KeyBeingWritten {
+                    key: key.to_string(),
+                }))
+            };
+        }
         if reject_if_inflight_same_key && state.local_puts > 0 {
             return (reusable_singleflight)
                 .then(|| state.external_put.clone())
@@ -4424,6 +5717,23 @@ impl ClientKvApiInner {
             .map(|info| info.mem_holder.clone())
     }
 
+    /// Resolve payloads that an external local probe can consume immediately.
+    ///
+    /// A pending local Get has completed its physical transfer and already
+    /// returned the same resident `MemoryInfo` to its leader.  Reusing that Arc
+    /// prevents a concurrent request from claiming a second owner target while
+    /// the asynchronous master route commit is still in flight.  Callers hold
+    /// the per-key fence across this lookup, so promotion or abort cannot race
+    /// the selection.  Pending entries deliberately remain outside the normal
+    /// committed lookup helper so they cannot receive a Moka hot-touch.
+    fn external_local_probe_mem_holder_unfenced(&self, key: &str) -> Option<Arc<MemoryInfo>> {
+        self.local_visible_mem_holder_unfenced(key).or_else(|| {
+            self.pending_local_get_info
+                .get(key)
+                .map(|pending| pending.mem_holder.clone())
+        })
+    }
+
     pub(crate) fn local_visible_mem_holders(
         &self,
         keys: &[String],
@@ -4571,6 +5881,38 @@ impl ClientKvApiInner {
             segment_offset,
             capacity_bytes,
             PendingLocalGetSource::PreparedDestination,
+            None,
+        )
+    }
+
+    pub(crate) fn install_hidden_leased_pending_local_get(
+        &self,
+        key: &str,
+        get_id: u64,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        capability: &crate::owner_segment::OwnerTargetWriteCapability,
+    ) -> KvResult<Arc<MemoryInfo>> {
+        let target = &capability.slot;
+        let len = u32::try_from(target.len).map_err(|_| {
+            KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "owner Get target length exceeds u32: key={} len={}",
+                    key, target.len
+                ),
+            })
+        })?;
+        self.install_hidden_owner_slot_get(
+            key,
+            get_id,
+            put_id,
+            target.addr,
+            target.base_addr,
+            len,
+            target.allocation_id,
+            target.segment_offset,
+            target.capacity_bytes,
+            PendingLocalGetSource::PreparedDestination,
+            Some(capability),
         )
     }
 
@@ -4597,6 +5939,7 @@ impl ClientKvApiInner {
             segment_offset,
             capacity_bytes,
             PendingLocalGetSource::ExistingGlobalShared,
+            None,
         )
     }
 
@@ -4613,6 +5956,7 @@ impl ClientKvApiInner {
         segment_offset: u64,
         capacity_bytes: u64,
         source: PendingLocalGetSource,
+        target_write_capability: Option<&crate::owner_segment::OwnerTargetWriteCapability>,
     ) -> KvResult<Arc<MemoryInfo>> {
         let controls = self.owner_key_control.lock_key(key);
         if controls
@@ -4626,11 +5970,34 @@ impl ClientKvApiInner {
         }
         match source {
             PendingLocalGetSource::PreparedDestination => {
-                self.owner_mark_local_reserve_slot_pending_visible(
-                    allocation_id,
-                    segment_offset,
-                    capacity_bytes,
-                )?;
+                if let Some(capability) = target_write_capability {
+                    if capability.slot.allocation_id != allocation_id
+                        || capability.slot.segment_offset != segment_offset
+                        || capability.slot.capacity_bytes != capacity_bytes
+                    {
+                        return Err(KvError::Api(ApiError::InvalidArgument {
+                            detail: "Get target capability geometry changed before hidden install"
+                                .to_string(),
+                        }));
+                    }
+                    self.owner_segment_allocator
+                        .lock()
+                        .mark_data_ready_get_target_pending_visible(capability)
+                        .map_err(|error| {
+                            KvError::Api(ApiError::Unknown {
+                                detail: format!(
+                                    "failed to install DataReady Get target: {}",
+                                    error.detail
+                                ),
+                            })
+                        })?;
+                } else {
+                    self.owner_mark_local_reserve_slot_pending_visible(
+                        allocation_id,
+                        segment_offset,
+                        capacity_bytes,
+                    )?;
+                }
                 self.owner_retain_local_reserve_resident_slot_holder(
                     allocation_id,
                     segment_offset,
@@ -4664,6 +6031,7 @@ impl ClientKvApiInner {
                 put_id,
                 mem_holder: memory_info.clone(),
                 source,
+                target_write_capability: target_write_capability.cloned(),
             },
         );
         assert!(
@@ -4676,6 +6044,33 @@ impl ClientKvApiInner {
 
     pub(crate) fn abort_hidden_pending_local_get(&self, key: &str, get_id: u64) -> bool {
         let _controls = self.owner_key_control.lock_key(key);
+        let capability = self.pending_local_get_info.get(key).and_then(|pending| {
+            (pending.get_id == get_id)
+                .then(|| pending.target_write_capability.clone())
+                .flatten()
+        });
+        if let Some(capability) = capability {
+            let outcome = self
+                .owner_segment_allocator
+                .lock()
+                .abort_data_ready_visible_get_target(
+                    &capability.operation,
+                    &capability.lease_id,
+                    "master GetDone rejected the hidden target".to_string(),
+                );
+            if !matches!(
+                outcome,
+                crate::owner_segment::OwnerSegmentTransferOutcome::TargetAborted
+            ) {
+                tracing::error!(
+                    key,
+                    get_id,
+                    outcome = ?outcome,
+                    "refusing to remove a hidden Get target whose operation did not abort"
+                );
+                return false;
+            }
+        }
         self.pending_local_get_info
             .remove_if(key, |_, pending| pending.get_id == get_id)
             .is_some()
@@ -4697,10 +6092,15 @@ impl ClientKvApiInner {
                     key: key.to_string(),
                 }));
             }
-            let Some((pending_memory_info, source)) =
+            let Some((pending_memory_info, source, target_write_capability)) =
                 self.pending_local_get_info.get(key).and_then(|pending| {
-                    (pending.get_id == get_id && pending.put_id == put_id)
-                        .then(|| (pending.mem_holder.clone(), pending.source))
+                    (pending.get_id == get_id && pending.put_id == put_id).then(|| {
+                        (
+                            pending.mem_holder.clone(),
+                            pending.source,
+                            pending.target_write_capability.clone(),
+                        )
+                    })
                 })
             else {
                 return Err(KvError::Api(ApiError::Unknown {
@@ -4714,28 +6114,47 @@ impl ClientKvApiInner {
                 .local_reserve_resident_slot_ref()
                 .expect("pending local Get must carry a local-reserve slot");
             if source == PendingLocalGetSource::PreparedDestination {
-                self.owner_promote_local_reserve_pending_slot_to_committed(
-                    allocation_id,
-                    segment_offset,
-                    capacity_bytes,
-                )?;
-                self.owner_segment_allocator
-                    .lock()
-                    .install_committed_manifest(
-                        key,
-                        put_id,
+                if let Some(capability) = target_write_capability.as_ref() {
+                    let outcome = self
+                        .owner_segment_allocator
+                        .lock()
+                        .finish_data_ready_get_target(
+                            &capability.operation,
+                            &capability.lease_id,
+                            allocation_id,
+                        );
+                    if !matches!(
+                        outcome,
+                        crate::owner_segment::OwnerSegmentTransferOutcome::TargetCommitted { .. }
+                    ) {
+                        return Err(KvError::Api(ApiError::Unknown {
+                            detail: format!("failed to commit DataReady Get target: {outcome:?}"),
+                        }));
+                    }
+                } else {
+                    self.owner_promote_local_reserve_pending_slot_to_committed(
                         allocation_id,
-                        crate::owner_segment::OwnerSlotScope::LocalExclusive,
-                        allocation_id,
-                    )
-                    .map_err(|error| {
-                        KvError::Api(ApiError::Unknown {
-                            detail: format!(
-                                "failed to install committed Get target manifest: {}",
-                                error.detail
-                            ),
-                        })
-                    })?;
+                        segment_offset,
+                        capacity_bytes,
+                    )?;
+                    self.owner_segment_allocator
+                        .lock()
+                        .install_committed_manifest(
+                            key,
+                            put_id,
+                            allocation_id,
+                            crate::owner_segment::OwnerSlotScope::LocalExclusive,
+                            allocation_id,
+                        )
+                        .map_err(|error| {
+                            KvError::Api(ApiError::Unknown {
+                                detail: format!(
+                                    "failed to install committed Get target manifest: {}",
+                                    error.detail
+                                ),
+                            })
+                        })?;
+                }
             } else {
                 self.owner_segment_allocator
                     .lock()
@@ -5133,6 +6552,9 @@ struct OwnerSourceLeaseRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnerTargetLeaseState {
     Prepared,
+    DataReady {
+        receipt: crate::owner_segment::OwnerTransferReceipt,
+    },
     RoutePending {
         receipt: crate::owner_segment::OwnerTransferReceipt,
         route_token: Option<crate::owner_segment::OwnerTargetRouteToken>,
@@ -5185,13 +6607,23 @@ struct OwnerSegmentState {
     /// Ordered physical offsets are maintained separately so allocatable-slot
     /// accounting walks every real free extent instead of combining holes.
     allocations_by_offset: BTreeMap<u32, u64>,
-    manifest_by_key:
-        HashMap<crate::owner_segment::OwnerManifestKey, crate::owner_segment::OwnerSlotManifestEntry>,
+    manifest_by_key: HashMap<
+        crate::owner_segment::OwnerManifestKey,
+        crate::owner_segment::OwnerSlotManifestEntry,
+    >,
     manifest_key_by_allocation: HashMap<u64, crate::owner_segment::OwnerManifestKey>,
-    source_leases:
-        HashMap<crate::owner_segment::OwnerTransferOpId, OwnerSourceLeaseRecord>,
-    target_leases:
-        HashMap<crate::owner_segment::OwnerTransferOpId, OwnerTargetLeaseRecord>,
+    source_leases: HashMap<crate::owner_segment::OwnerTransferOpId, OwnerSourceLeaseRecord>,
+    target_leases: HashMap<crate::owner_segment::OwnerTransferOpId, OwnerTargetLeaseRecord>,
+    /// Logical GlobalShared capacity reserved by exact LocalExclusive
+    /// generations before their metadata-only demotion RPC.  These bytes are
+    /// admission state, not projected physical reclaim credit.  A retry of
+    /// the same fenced generation reuses the same entry.
+    global_demotion_reservations: HashMap<crate::owner_segment::OwnerManifestKey, OwnerSlotRef>,
+    /// Advances only after the unique allocator has actually returned one
+    /// allocation to its free extents.  Aggregate free bytes can stay flat
+    /// when another claimant consumes the extent immediately, so pressure
+    /// progress must not infer exact Free from that aggregate.
+    physical_free_epoch: u64,
 }
 
 impl std::fmt::Debug for OwnerSegmentState {
@@ -5207,6 +6639,11 @@ impl std::fmt::Debug for OwnerSegmentState {
             .field("manifest_entries", &self.manifest_by_key.len())
             .field("source_leases", &self.source_leases.len())
             .field("target_leases", &self.target_leases.len())
+            .field(
+                "global_demotion_reservations",
+                &self.global_demotion_reservations.len(),
+            )
+            .field("physical_free_epoch", &self.physical_free_epoch)
             .field(
                 "free_bytes",
                 &(u64::from(report.total_free_space)
@@ -5268,6 +6705,8 @@ impl OwnerSegmentState {
             manifest_key_by_allocation: HashMap::new(),
             source_leases: HashMap::new(),
             target_leases: HashMap::new(),
+            global_demotion_reservations: HashMap::new(),
+            physical_free_epoch: 0,
         })
     }
 
@@ -5363,13 +6802,19 @@ impl OwnerSegmentState {
     fn identity_matches_desc(&self, slot: &OwnerSlotRef) -> bool {
         slot.owner == self.owner
             && slot.segment_registration_epoch == self.registration_epoch
-            && slot.addr == self.addr.checked_add(slot.segment_offset).unwrap_or(u64::MAX)
+            && slot.addr
+                == self
+                    .addr
+                    .checked_add(slot.segment_offset)
+                    .unwrap_or(u64::MAX)
             && slot.base_addr == self.base_addr
-            && self.allocation(slot.allocation_id).is_some_and(|allocation| {
-                allocation.segment_offset == slot.segment_offset
-                    && allocation.capacity_bytes == slot.capacity_bytes
-                    && allocation.value_len == slot.len
-            })
+            && self
+                .allocation(slot.allocation_id)
+                .is_some_and(|allocation| {
+                    allocation.segment_offset == slot.segment_offset
+                        && allocation.capacity_bytes == slot.capacity_bytes
+                        && allocation.value_len == slot.len
+                })
     }
 
     fn install_manifest_entry(
@@ -5378,7 +6823,9 @@ impl OwnerSegmentState {
     ) -> Result<(), crate::owner_segment::OwnerTransferItemError> {
         use crate::owner_segment::{OwnerManifestKey, OwnerTransferErrorCode};
 
-        if entry.key.is_empty() || !entry.slot.is_valid() || !self.identity_matches_desc(&entry.slot)
+        if entry.key.is_empty()
+            || !entry.slot.is_valid()
+            || !self.identity_matches_desc(&entry.slot)
         {
             return Err(crate::owner_segment::OwnerTransferItemError::new(
                 OwnerTransferErrorCode::InvalidArgument,
@@ -5389,8 +6836,7 @@ impl OwnerSegmentState {
         if let Some(existing) = self.manifest_by_key.get(&manifest_key) {
             if existing.slot.geometry_matches(&entry.slot)
                 && existing.slot.len == entry.slot.len
-                && existing.slot.segment_registration_epoch
-                    == entry.slot.segment_registration_epoch
+                && existing.slot.segment_registration_epoch == entry.slot.segment_registration_epoch
             {
                 return Ok(());
             }
@@ -5436,10 +6882,7 @@ impl OwnerSegmentState {
         &mut self,
         allocation_id: u64,
     ) -> Option<&mut crate::owner_segment::OwnerSlotManifestEntry> {
-        let key = self
-            .manifest_key_by_allocation
-            .get(&allocation_id)?
-            .clone();
+        let key = self.manifest_key_by_allocation.get(&allocation_id)?.clone();
         self.manifest_by_key.get_mut(&key)
     }
 
@@ -5466,7 +6909,7 @@ impl OwnerSegmentState {
             if existing.route_token != route_token {
                 return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                     OwnerTransferErrorCode::Conflict,
-                    "AcquireSource replay changed the route token",
+                    "source lease replay changed the route token",
                 ));
             }
             return match existing.state {
@@ -5474,15 +6917,13 @@ impl OwnerSegmentState {
                     lease_id: existing.lease_id.clone(),
                     slot: existing.route_token.source.clone(),
                 },
-                OwnerSourceLeaseState::Released(_) => {
-                    OwnerSegmentTransferOutcome::SourceReleased
-                }
+                OwnerSourceLeaseState::Released(_) => OwnerSegmentTransferOutcome::SourceReleased,
             };
         }
         if !op_id.is_initialized() || !lease_id.is_initialized() || route_token.plan_nonce == 0 {
             return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                 OwnerTransferErrorCode::InvalidArgument,
-                "AcquireSource requires initialized operation, lease and plan identities",
+                "source lease acquire requires initialized operation, lease and plan identities",
             ));
         }
         if route_token.source.owner != self.owner
@@ -5490,7 +6931,7 @@ impl OwnerSegmentState {
         {
             return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                 OwnerTransferErrorCode::StaleGeneration,
-                "AcquireSource names a stale owner or segment registration generation",
+                "source lease acquire names a stale owner or segment registration generation",
             ));
         }
         let manifest_key =
@@ -5498,7 +6939,7 @@ impl OwnerSegmentState {
         let Some(manifest) = self.manifest_by_key.get(&manifest_key) else {
             return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                 OwnerTransferErrorCode::NotFound,
-                "AcquireSource key generation is absent from the owner manifest",
+                "source lease acquire key generation is absent from the owner manifest",
             ));
         };
         if manifest.physical_state != OwnerSlotPhysicalState::Committed
@@ -5509,13 +6950,13 @@ impl OwnerSegmentState {
         {
             return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                 OwnerTransferErrorCode::Conflict,
-                "AcquireSource route token does not match the committed owner manifest",
+                "source lease route token does not match the committed owner manifest",
             ));
         }
         let Some(allocation) = self.allocation_mut(route_token.source.allocation_id) else {
             return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                 OwnerTransferErrorCode::NotFound,
-                "AcquireSource slot disappeared from the owner allocator",
+                "source lease slot disappeared from the owner allocator",
             ));
         };
         if !matches!(
@@ -5527,7 +6968,7 @@ impl OwnerSegmentState {
         ) {
             return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                 OwnerTransferErrorCode::Reclaiming,
-                "AcquireSource slot is no longer readable",
+                "source lease slot is no longer readable",
             ));
         }
         allocation.source_read_lease_count = allocation
@@ -5561,13 +7002,13 @@ impl OwnerSegmentState {
         let Some(record) = self.source_leases.get(op_id) else {
             return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                 OwnerTransferErrorCode::NotFound,
-                "ReleaseSource operation is absent",
+                "source lease release operation is absent",
             ));
         };
         if &record.lease_id != lease_id {
             return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                 OwnerTransferErrorCode::Conflict,
-                "ReleaseSource lease identity mismatch",
+                "source lease release identity mismatch",
             ));
         }
         match record.state {
@@ -5575,7 +7016,7 @@ impl OwnerSegmentState {
                 if previous != outcome {
                     return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                         OwnerTransferErrorCode::Conflict,
-                        "ReleaseSource replay changed the transfer outcome",
+                        "source lease release replay changed the transfer outcome",
                     ));
                 }
                 return OwnerSegmentTransferOutcome::SourceReleased;
@@ -5667,7 +7108,13 @@ impl OwnerSegmentState {
             allocation.source_read_lease_count, 0,
             "free_allocation cannot release a slot with active source read leases"
         );
-        self.remove_manifest_for_allocation(allocation_id);
+        if let Some(manifest) = self.remove_manifest_for_allocation(allocation_id) {
+            self.global_demotion_reservations
+                .remove(&crate::owner_segment::OwnerManifestKey::new(
+                    manifest.key,
+                    manifest.put_id,
+                ));
+        }
         assert_eq!(
             self.allocations_by_offset
                 .remove(&allocation.allocation.offset),
@@ -5675,6 +7122,7 @@ impl OwnerSegmentState {
             "owner segment offset index diverged from allocation identity"
         );
         self.allocator.free(allocation.allocation);
+        self.physical_free_epoch = self.physical_free_epoch.saturating_add(1);
     }
 
     fn mark_prepared_slot_pending_visible(&mut self, allocation_id: u64) {
@@ -5906,6 +7354,36 @@ impl OwnerSegmentState {
             slot_unallocatable_bytes: raw_free_bytes.saturating_sub(allocatable_bytes),
         }
     }
+
+    fn global_committed_bytes(&self) -> u64 {
+        self.allocations
+            .iter()
+            .filter_map(|(allocation_id, allocation)| {
+                let manifest_key = self.manifest_key_by_allocation.get(allocation_id)?;
+                let manifest = self.manifest_by_key.get(manifest_key)?;
+                (manifest.disposition == crate::owner_segment::OwnerTargetDisposition::GlobalShared)
+                    .then_some(allocation.capacity_bytes)
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
+    fn global_reserved_demotion_bytes(&self) -> u64 {
+        self.global_demotion_reservations
+            .values()
+            .map(|slot| slot.capacity_bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    fn global_accounted_bytes(&self) -> u64 {
+        self.global_committed_bytes()
+            .saturating_add(self.global_reserved_demotion_bytes())
+    }
+
+    fn allocation_size_classes(&self) -> impl Iterator<Item = u64> + '_ {
+        self.allocations
+            .values()
+            .map(|allocation| allocation.capacity_bytes)
+    }
 }
 
 /// Owner-side authority for the complete DRAM segment.  The optional inner
@@ -5931,6 +7409,9 @@ pub(crate) struct OwnerSegmentAllocator {
     pub local_target_bytes: u64,
     pub controller_epoch: u64,
     pub expected_slot_size: Option<u64>,
+    /// Size classes requested by the master through capacity-report replies.
+    /// This is allocator metadata only; it does not reserve physical bytes.
+    capacity_report_requested_size_classes: std::collections::BTreeSet<u64>,
 }
 
 impl OwnerSegmentAllocator {
@@ -5947,9 +7428,9 @@ impl OwnerSegmentAllocator {
         if self.segment.is_some() {
             return Err("owner segment allocator must be installed exactly once".to_string());
         }
-        if local_target_bytes == 0 || local_target_bytes > len {
+        if local_target_bytes > len {
             return Err(format!(
-                "owner local target must be in [1, segment_bytes]: target={} segment={}",
+                "owner local target must be in [0, segment_bytes]: target={} segment={}",
                 local_target_bytes, len
             ));
         }
@@ -5963,6 +7444,9 @@ impl OwnerSegmentAllocator {
         self.local_target_bytes = local_target_bytes;
         self.controller_epoch = 1;
         self.expected_slot_size = expected_slot_size;
+        self.capacity_report_requested_size_classes.clear();
+        self.capacity_report_requested_size_classes
+            .extend(expected_slot_size);
         Ok(())
     }
 
@@ -6021,8 +7505,8 @@ impl OwnerSegmentAllocator {
         }
         if local_target_bytes == 0 || local_target_bytes > segment_bytes {
             return Err(format!(
-                "owner local target must be in [1, {}], got {}",
-                segment_bytes, local_target_bytes
+                "inference owner local target must be in [1, {}], got {}",
+                segment_bytes, local_target_bytes,
             ));
         }
         self.local_target_bytes = local_target_bytes;
@@ -6046,8 +7530,7 @@ impl OwnerSegmentAllocator {
                 .checked_add(1)
                 .expect("owner allocation id exhausted");
             let allocation_id = self.next_allocation_id;
-            let Some(slot) =
-                segment.claim_prepared_slot(slot_size, value_len, allocation_id)
+            let Some(slot) = segment.claim_prepared_slot(slot_size, value_len, allocation_id)
             else {
                 break;
             };
@@ -6197,6 +7680,12 @@ impl OwnerSegmentAllocator {
                     slot: existing.slot.clone(),
                     state: OwnerTargetLeaseStateView::Prepared,
                 },
+                OwnerTargetLeaseState::DataReady { .. } => {
+                    OwnerSegmentTransferOutcome::TargetDataReady {
+                        lease_id: existing.lease_id.clone(),
+                        slot: existing.slot.clone(),
+                    }
+                }
                 OwnerTargetLeaseState::RoutePending { .. } => {
                     OwnerSegmentTransferOutcome::TargetCommitPending {
                         lease_id: existing.lease_id.clone(),
@@ -6210,9 +7699,7 @@ impl OwnerSegmentAllocator {
                         route_epoch: *route_epoch,
                     }
                 }
-                OwnerTargetLeaseState::Aborted { .. } => {
-                    OwnerSegmentTransferOutcome::TargetAborted
-                }
+                OwnerTargetLeaseState::Aborted { .. } => OwnerSegmentTransferOutcome::TargetAborted,
             };
         }
         if !op_id.is_initialized() || key.is_empty() || len == 0 {
@@ -6228,7 +7715,30 @@ impl OwnerSegmentAllocator {
             ));
         }
 
-        let mut slots = self.claim_value(len, 1);
+        let Some(slot_size) = crate::owner_segment_allocation_capacity_bytes(len) else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::InvalidArgument,
+                format!("PrepareTarget length cannot be represented: {len}"),
+            ));
+        };
+        if disposition == crate::owner_segment::OwnerTargetDisposition::GlobalShared {
+            let global_target_bytes = segment.len.saturating_sub(self.local_target_bytes);
+            let global_accounted_bytes = segment.global_accounted_bytes();
+            if global_accounted_bytes
+                .checked_add(slot_size)
+                .is_none_or(|next| next > global_target_bytes)
+            {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::NoSpace,
+                    format!(
+                        "PrepareTarget GlobalShared budget is full: accounted={} requested={} target={}",
+                        global_accounted_bytes, slot_size, global_target_bytes,
+                    ),
+                ));
+            }
+        }
+
+        let mut slots = self.claim_available_with_len(slot_size, len, 1);
         let Some(slot) = slots.pop() else {
             return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
                 OwnerTransferErrorCode::NoSpace,
@@ -6297,6 +7807,243 @@ impl OwnerSegmentAllocator {
         }
     }
 
+    /// Bind an already-claimed requester-local slot to one Get operation.
+    ///
+    /// The pressure path remains the sole allocator admission authority. This
+    /// method only turns that exact Prepared allocation into a generation-safe
+    /// target lease before its capability is sent to a source owner.
+    pub fn prepare_claimed_get_target(
+        &mut self,
+        op_id: crate::owner_segment::OwnerTransferOpId,
+        key: String,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        atomic_batch: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
+        slot: OwnerSlotRef,
+    ) -> crate::owner_segment::OwnerSegmentTransferOutcome {
+        use crate::owner_segment::{
+            OwnerSegmentTransferOutcome, OwnerSlotManifestEntry, OwnerSlotPhysicalState,
+            OwnerSlotScope, OwnerTargetDisposition, OwnerTargetLeaseStateView,
+            OwnerTransferErrorCode, OwnerTransferItemError, OwnerTransferOpKind,
+        };
+
+        let Some(segment) = self.segment.as_ref() else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Busy,
+                "owner segment allocator is not initialized",
+            ));
+        };
+        if let Some(existing) = segment.target_leases.get(&op_id) {
+            if existing.key != key
+                || existing.put_id != put_id
+                || existing.len != slot.len
+                || existing.disposition != OwnerTargetDisposition::LocalExclusive
+                || existing.atomic_batch != atomic_batch
+                || existing.slot != slot
+            {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::Conflict,
+                    "claimed Get target replay changed operation parameters",
+                ));
+            }
+            return match &existing.state {
+                OwnerTargetLeaseState::Prepared => OwnerSegmentTransferOutcome::TargetPrepared {
+                    lease_id: existing.lease_id.clone(),
+                    slot: existing.slot.clone(),
+                    state: OwnerTargetLeaseStateView::Prepared,
+                },
+                OwnerTargetLeaseState::DataReady { .. } => {
+                    OwnerSegmentTransferOutcome::TargetDataReady {
+                        lease_id: existing.lease_id.clone(),
+                        slot: existing.slot.clone(),
+                    }
+                }
+                OwnerTargetLeaseState::RoutePending { .. } => {
+                    OwnerSegmentTransferOutcome::TargetCommitPending {
+                        lease_id: existing.lease_id.clone(),
+                        slot: existing.slot.clone(),
+                    }
+                }
+                OwnerTargetLeaseState::Committed { route_epoch } => {
+                    OwnerSegmentTransferOutcome::TargetCommitted {
+                        lease_id: existing.lease_id.clone(),
+                        slot: existing.slot.clone(),
+                        route_epoch: *route_epoch,
+                    }
+                }
+                OwnerTargetLeaseState::Aborted { .. } => OwnerSegmentTransferOutcome::TargetAborted,
+            };
+        }
+        if !op_id.is_initialized()
+            || op_id.kind != OwnerTransferOpKind::Get
+            || key.is_empty()
+            || !slot.is_valid()
+            || slot.owner != segment.owner
+            || slot.len == 0
+            || !segment.identity_matches_desc(&slot)
+            || !segment
+                .allocation(slot.allocation_id)
+                .is_some_and(|allocation| matches!(allocation.state, OwnerSlotState::Prepared))
+        {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::InvalidArgument,
+                "claimed Get target is not the exact live Prepared owner slot",
+            ));
+        }
+        let key_generation_conflict = segment.manifest_entry(&key, put_id).is_some();
+        let allocation_identity_conflict = segment
+            .manifest_key_by_allocation
+            .contains_key(&slot.allocation_id);
+        if key_generation_conflict && !allocation_identity_conflict {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::StalePlan,
+                format!(
+                    "claimed Get target became stale because the exact key generation materialized locally: allocation_id={}",
+                    slot.allocation_id
+                ),
+            ));
+        }
+        if allocation_identity_conflict {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                format!(
+                    "claimed Get target already belongs to an owner manifest: key_generation_conflict={} allocation_identity_conflict={} allocation_id={}",
+                    key_generation_conflict, allocation_identity_conflict, slot.allocation_id
+                ),
+            ));
+        }
+
+        let lease_id = match self.allocate_lease_id() {
+            Ok(lease_id) => lease_id,
+            Err(error) => return OwnerSegmentTransferOutcome::Error(error),
+        };
+        let entry = OwnerSlotManifestEntry {
+            key: key.clone(),
+            put_id,
+            slot: slot.clone(),
+            scope: Some(OwnerSlotScope::LocalExclusive),
+            disposition: OwnerTargetDisposition::LocalExclusive,
+            route_epoch: 0,
+            physical_state: OwnerSlotPhysicalState::Reserved,
+        };
+        let segment = self
+            .segment
+            .as_mut()
+            .expect("claimed Get target validation requires an installed segment");
+        if let Err(error) = segment.install_manifest_entry(entry) {
+            return OwnerSegmentTransferOutcome::Error(error);
+        }
+        segment.target_leases.insert(
+            op_id,
+            OwnerTargetLeaseRecord {
+                lease_id: lease_id.clone(),
+                key,
+                put_id,
+                len: slot.len,
+                disposition: OwnerTargetDisposition::LocalExclusive,
+                atomic_batch,
+                slot: slot.clone(),
+                state: OwnerTargetLeaseState::Prepared,
+            },
+        );
+        OwnerSegmentTransferOutcome::TargetPrepared {
+            lease_id,
+            slot,
+            state: OwnerTargetLeaseStateView::Prepared,
+        }
+    }
+
+    /// Record a source-generated completion receipt before exposing or
+    /// publishing the target. Replays must present the same exact receipt.
+    pub fn mark_target_data_ready(
+        &mut self,
+        op_id: &crate::owner_segment::OwnerTransferOpId,
+        lease_id: &crate::owner_segment::OwnerLeaseId,
+        receipt: crate::owner_segment::OwnerTransferReceipt,
+    ) -> crate::owner_segment::OwnerSegmentTransferOutcome {
+        use crate::owner_segment::{
+            OwnerSegmentTransferOutcome, OwnerSlotPhysicalState, OwnerTransferErrorCode,
+            OwnerTransferItemError,
+        };
+
+        let Some(segment) = self.segment.as_mut() else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Busy,
+                "owner segment allocator is not initialized",
+            ));
+        };
+        let Some(existing) = segment.target_leases.get(op_id) else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::NotFound,
+                "Get target operation is absent",
+            ));
+        };
+        if &existing.lease_id != lease_id {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "Get target lease identity mismatch",
+            ));
+        }
+        match &existing.state {
+            OwnerTargetLeaseState::DataReady {
+                receipt: previous_receipt,
+            } => {
+                if previous_receipt != &receipt {
+                    return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                        OwnerTransferErrorCode::Conflict,
+                        "Get target replay changed the transfer receipt",
+                    ));
+                }
+                return OwnerSegmentTransferOutcome::TargetDataReady {
+                    lease_id: existing.lease_id.clone(),
+                    slot: existing.slot.clone(),
+                };
+            }
+            OwnerTargetLeaseState::Committed { route_epoch } => {
+                return OwnerSegmentTransferOutcome::TargetCommitted {
+                    lease_id: existing.lease_id.clone(),
+                    slot: existing.slot.clone(),
+                    route_epoch: *route_epoch,
+                };
+            }
+            OwnerTargetLeaseState::RoutePending { .. } => {
+                return OwnerSegmentTransferOutcome::TargetCommitPending {
+                    lease_id: existing.lease_id.clone(),
+                    slot: existing.slot.clone(),
+                };
+            }
+            OwnerTargetLeaseState::Aborted { .. } => {
+                return OwnerSegmentTransferOutcome::TargetAborted;
+            }
+            OwnerTargetLeaseState::Prepared => {}
+        }
+        if receipt.completion_id == 0
+            || receipt.bytes != existing.len
+            || receipt.target != existing.slot
+            || receipt.target_registration_epoch != existing.slot.segment_registration_epoch
+        {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::InvalidArgument,
+                "Get receipt does not prove completion into the exact target lease",
+            ));
+        }
+        let allocation_id = existing.slot.allocation_id;
+        let response_lease = existing.lease_id.clone();
+        let response_slot = existing.slot.clone();
+        segment
+            .target_leases
+            .get_mut(op_id)
+            .expect("validated Get target lease disappeared")
+            .state = OwnerTargetLeaseState::DataReady { receipt };
+        segment
+            .manifest_entry_mut_by_allocation(allocation_id)
+            .expect("prepared Get target must have a manifest entry")
+            .physical_state = OwnerSlotPhysicalState::DataReady;
+        OwnerSegmentTransferOutcome::TargetDataReady {
+            lease_id: response_lease,
+            slot: response_slot,
+        }
+    }
+
     pub fn begin_target_commit(
         &mut self,
         op_id: &crate::owner_segment::OwnerTransferOpId,
@@ -6353,7 +8100,7 @@ impl OwnerSegmentAllocator {
                     slot: existing.slot.clone(),
                 };
             }
-            OwnerTargetLeaseState::Prepared => {}
+            OwnerTargetLeaseState::Prepared | OwnerTargetLeaseState::DataReady { .. } => {}
         }
         if receipt.completion_id == 0
             || receipt.bytes != existing.len
@@ -6519,6 +8266,277 @@ impl OwnerSegmentAllocator {
         }
     }
 
+    /// Complete the requester-local half of a Get after master GetDone has
+    /// published the route. The payload was already proven DataReady by the
+    /// source terminal; this transition only changes owner metadata/state.
+    pub fn begin_data_ready_get_target_commit(
+        &mut self,
+        capability: &crate::owner_segment::OwnerTargetWriteCapability,
+    ) -> crate::owner_segment::OwnerSegmentTransferOutcome {
+        use crate::owner_segment::{
+            OwnerSegmentTransferOutcome, OwnerSlotPhysicalState, OwnerTransferErrorCode,
+            OwnerTransferItemError, OwnerTransferOpKind,
+        };
+
+        let Some(segment) = self.segment.as_mut() else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Busy,
+                "owner segment allocator is not initialized",
+            ));
+        };
+        let Some(existing) = segment.target_leases.get(&capability.operation) else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::NotFound,
+                "Get CommitTarget operation is absent",
+            ));
+        };
+        if capability.operation.kind != OwnerTransferOpKind::Get
+            || existing.lease_id != capability.lease_id
+            || existing.slot != capability.slot
+        {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "Get CommitTarget capability identity mismatch",
+            ));
+        }
+        match &existing.state {
+            OwnerTargetLeaseState::Committed { route_epoch } => {
+                return OwnerSegmentTransferOutcome::TargetCommitted {
+                    lease_id: existing.lease_id.clone(),
+                    slot: existing.slot.clone(),
+                    route_epoch: *route_epoch,
+                };
+            }
+            OwnerTargetLeaseState::RoutePending { route_token, .. } => {
+                if route_token.is_some() {
+                    return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                        OwnerTransferErrorCode::Conflict,
+                        "Get CommitTarget replay found a Put route token",
+                    ));
+                }
+                return OwnerSegmentTransferOutcome::TargetCommitPending {
+                    lease_id: existing.lease_id.clone(),
+                    slot: existing.slot.clone(),
+                };
+            }
+            OwnerTargetLeaseState::Aborted { .. } => {
+                return OwnerSegmentTransferOutcome::TargetAborted;
+            }
+            OwnerTargetLeaseState::Prepared => {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::RouteCommitRequired,
+                    "Get CommitTarget cannot start before payload DataReady",
+                ));
+            }
+            OwnerTargetLeaseState::DataReady { .. } => {}
+        }
+        if !segment
+            .allocation(existing.slot.allocation_id)
+            .is_some_and(|allocation| {
+                matches!(allocation.state, OwnerSlotState::PendingLocalVisible { .. })
+            })
+        {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "Get CommitTarget requires its hidden PendingLocalVisible slot",
+            ));
+        }
+        let receipt = match &existing.state {
+            OwnerTargetLeaseState::DataReady { receipt } => receipt.clone(),
+            _ => unreachable!("validated DataReady Get target"),
+        };
+        let allocation_id = existing.slot.allocation_id;
+        let response_lease = existing.lease_id.clone();
+        let response_slot = existing.slot.clone();
+        segment
+            .target_leases
+            .get_mut(&capability.operation)
+            .expect("validated Get target lease disappeared")
+            .state = OwnerTargetLeaseState::RoutePending {
+            receipt,
+            route_token: None,
+        };
+        segment
+            .manifest_entry_mut_by_allocation(allocation_id)
+            .expect("DataReady Get target must have a manifest entry")
+            .physical_state = OwnerSlotPhysicalState::RoutePending;
+        OwnerSegmentTransferOutcome::TargetCommitPending {
+            lease_id: response_lease,
+            slot: response_slot,
+        }
+    }
+
+    pub fn finish_data_ready_get_target(
+        &mut self,
+        op_id: &crate::owner_segment::OwnerTransferOpId,
+        lease_id: &crate::owner_segment::OwnerLeaseId,
+        route_epoch: u64,
+    ) -> crate::owner_segment::OwnerSegmentTransferOutcome {
+        use crate::owner_segment::{
+            OwnerSegmentTransferOutcome, OwnerSlotPhysicalState, OwnerTransferErrorCode,
+            OwnerTransferItemError,
+        };
+
+        let Some(segment) = self.segment.as_mut() else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Busy,
+                "owner segment allocator is not initialized",
+            ));
+        };
+        let Some(existing) = segment.target_leases.get(op_id) else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::NotFound,
+                "Get target commit operation is absent",
+            ));
+        };
+        if &existing.lease_id != lease_id
+            || op_id.kind != crate::owner_segment::OwnerTransferOpKind::Get
+        {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "Get target commit identity mismatch",
+            ));
+        }
+        if let OwnerTargetLeaseState::Committed {
+            route_epoch: previous_epoch,
+        } = existing.state
+        {
+            if previous_epoch != route_epoch {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::Conflict,
+                    "Get target commit replay changed route epoch",
+                ));
+            }
+            return OwnerSegmentTransferOutcome::TargetCommitted {
+                lease_id: existing.lease_id.clone(),
+                slot: existing.slot.clone(),
+                route_epoch,
+            };
+        }
+        let state_can_commit = matches!(
+            existing.state,
+            OwnerTargetLeaseState::DataReady { .. }
+                | OwnerTargetLeaseState::RoutePending {
+                    route_token: None,
+                    ..
+                }
+        );
+        if route_epoch == 0 || !state_can_commit {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::RouteCommitRequired,
+                "Get target is not DataReady/RoutePending or lacks a committed route epoch",
+            ));
+        }
+        let allocation_id = existing.slot.allocation_id;
+        let response_lease = existing.lease_id.clone();
+        let response_slot = existing.slot.clone();
+        if !segment.allocation(allocation_id).is_some_and(|allocation| {
+            matches!(allocation.state, OwnerSlotState::PendingLocalVisible { .. })
+        }) {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "Get target must be hidden PendingLocalVisible before commit",
+            ));
+        }
+        segment.promote_pending_visible_slot_to_committed(allocation_id);
+        let manifest = segment
+            .manifest_entry_mut_by_allocation(allocation_id)
+            .expect("DataReady Get target must have a manifest entry");
+        manifest.physical_state = OwnerSlotPhysicalState::Committed;
+        manifest.route_epoch = route_epoch;
+        segment
+            .target_leases
+            .get_mut(op_id)
+            .expect("validated Get target lease disappeared")
+            .state = OwnerTargetLeaseState::Committed { route_epoch };
+        self.pending_visible_slots = self
+            .pending_visible_slots
+            .checked_sub(1)
+            .expect("pending-visible slot counter underflow");
+        self.committed_slots = self
+            .committed_slots
+            .checked_add(1)
+            .expect("committed slot overflow");
+        OwnerSegmentTransferOutcome::TargetCommitted {
+            lease_id: response_lease,
+            slot: response_slot,
+            route_epoch,
+        }
+    }
+
+    /// Abort an unpublished Get target after it has become hidden resident
+    /// state.  DataReady is used by the synchronous error path; RoutePending
+    /// with no Put route token is used when an asynchronous Get receives an
+    /// explicit master rejection.  The final MemoryInfo holder drop performs
+    /// the physical free, so a caller already consuming Async-Get bytes remains
+    /// safe; this method only closes the operation and manifest.
+    pub fn abort_data_ready_visible_get_target(
+        &mut self,
+        op_id: &crate::owner_segment::OwnerTransferOpId,
+        lease_id: &crate::owner_segment::OwnerLeaseId,
+        reason: String,
+    ) -> crate::owner_segment::OwnerSegmentTransferOutcome {
+        use crate::owner_segment::{
+            OwnerSegmentTransferOutcome, OwnerSlotPhysicalState, OwnerTransferErrorCode,
+            OwnerTransferItemError,
+        };
+
+        let Some(segment) = self.segment.as_mut() else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Busy,
+                "owner segment allocator is not initialized",
+            ));
+        };
+        let Some(existing) = segment.target_leases.get(op_id) else {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::NotFound,
+                "Get target abort operation is absent",
+            ));
+        };
+        if &existing.lease_id != lease_id {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "Get target abort lease identity mismatch",
+            ));
+        }
+        if matches!(existing.state, OwnerTargetLeaseState::Aborted { .. }) {
+            return OwnerSegmentTransferOutcome::TargetAborted;
+        }
+        let is_unpublished_get = matches!(
+            existing.state,
+            OwnerTargetLeaseState::DataReady { .. }
+                | OwnerTargetLeaseState::RoutePending {
+                    route_token: None,
+                    ..
+                }
+        );
+        if op_id.kind != crate::owner_segment::OwnerTransferOpKind::Get || !is_unpublished_get {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "only an unpublished DataReady/RoutePending Get target can use visible abort",
+            ));
+        }
+        let allocation_id = existing.slot.allocation_id;
+        if !segment.allocation(allocation_id).is_some_and(|allocation| {
+            matches!(allocation.state, OwnerSlotState::PendingLocalVisible { .. })
+        }) {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "visible Get target no longer owns PendingLocalVisible state",
+            ));
+        }
+        segment
+            .target_leases
+            .get_mut(op_id)
+            .expect("validated Get target lease disappeared")
+            .state = OwnerTargetLeaseState::Aborted { reason };
+        segment
+            .manifest_entry_mut_by_allocation(allocation_id)
+            .expect("unpublished Get target must have a manifest entry")
+            .physical_state = OwnerSlotPhysicalState::Reclaiming;
+        OwnerSegmentTransferOutcome::TargetAborted
+    }
+
     pub fn abort_target(
         &mut self,
         op_id: &crate::owner_segment::OwnerTransferOpId,
@@ -6563,7 +8581,7 @@ impl OwnerSegmentAllocator {
                     "RoutePending target requires master terminal reconciliation before abort",
                 ));
             }
-            OwnerTargetLeaseState::Prepared => {}
+            OwnerTargetLeaseState::Prepared | OwnerTargetLeaseState::DataReady { .. } => {}
         }
         let allocation_id = existing.slot.allocation_id;
         let record = segment
@@ -6742,6 +8760,14 @@ impl OwnerSegmentAllocator {
                 "owner manifest slot changed during scope conversion",
             ));
         }
+        if scope == crate::owner_segment::OwnerSlotScope::GlobalShared
+            && manifest.scope != Some(crate::owner_segment::OwnerSlotScope::GlobalShared)
+        {
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "LocalExclusive -> GlobalShared requires an owner budget reservation",
+            ));
+        }
         manifest.scope = Some(scope);
         manifest.disposition = match scope {
             crate::owner_segment::OwnerSlotScope::LocalExclusive => {
@@ -6751,6 +8777,173 @@ impl OwnerSegmentAllocator {
                 OwnerTargetDisposition::GlobalShared
             }
         };
+        Ok(())
+    }
+
+    /// Reserve the logical GlobalShared budget for one exact, already-fenced
+    /// LocalExclusive slot.  The payload stays in place and no physical bytes
+    /// are treated as free.  Replays of the same generation and slot reuse the
+    /// reservation; another claimant observes it through
+    /// `global_accounted_bytes` while holding this allocator's single mutex.
+    pub fn try_reserve_global_demotion(
+        &mut self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
+    ) -> Result<bool, crate::owner_segment::OwnerTransferItemError> {
+        use crate::owner_segment::{
+            OwnerManifestKey, OwnerSlotPhysicalState, OwnerSlotScope, OwnerTransferErrorCode,
+            OwnerTransferItemError,
+        };
+
+        let segment = self.segment.as_mut().ok_or_else(|| {
+            OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Busy,
+                "owner segment allocator is not initialized",
+            )
+        })?;
+        let manifest_key = OwnerManifestKey::new(key, put_id);
+        let manifest = segment.manifest_by_key.get(&manifest_key).ok_or_else(|| {
+            OwnerTransferItemError::new(
+                OwnerTransferErrorCode::NotFound,
+                "owner manifest entry is absent during GlobalShared reservation",
+            )
+        })?;
+        if manifest.slot.allocation_id != allocation_id
+            || manifest.slot.segment_offset != segment_offset
+            || manifest.slot.capacity_bytes != capacity_bytes
+            || manifest.physical_state != OwnerSlotPhysicalState::Committed
+        {
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "owner manifest slot changed during GlobalShared reservation",
+            ));
+        }
+        if manifest.scope == Some(OwnerSlotScope::GlobalShared) {
+            return Ok(true);
+        }
+        if manifest.scope != Some(OwnerSlotScope::LocalExclusive) {
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "only a committed LocalExclusive slot can reserve GlobalShared budget",
+            ));
+        }
+        let slot = manifest.slot.clone();
+        if let Some(existing) = segment.global_demotion_reservations.get(&manifest_key) {
+            if existing.geometry_matches(&slot)
+                && existing.len == slot.len
+                && existing.segment_registration_epoch == slot.segment_registration_epoch
+            {
+                return Ok(true);
+            }
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "GlobalShared reservation replay changed the exact owner slot",
+            ));
+        }
+        let global_target_bytes = segment.len.saturating_sub(self.local_target_bytes);
+        if segment
+            .global_accounted_bytes()
+            .checked_add(capacity_bytes)
+            .is_none_or(|next| next > global_target_bytes)
+        {
+            return Ok(false);
+        }
+        segment
+            .global_demotion_reservations
+            .insert(manifest_key, slot);
+        Ok(true)
+    }
+
+    pub fn release_global_demotion_reservation(
+        &mut self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
+    ) -> bool {
+        let Some(segment) = self.segment.as_mut() else {
+            return false;
+        };
+        let manifest_key = crate::owner_segment::OwnerManifestKey::new(key, put_id);
+        let matches = segment
+            .global_demotion_reservations
+            .get(&manifest_key)
+            .is_some_and(|slot| {
+                slot.allocation_id == allocation_id
+                    && slot.segment_offset == segment_offset
+                    && slot.capacity_bytes == capacity_bytes
+            });
+        if matches {
+            segment.global_demotion_reservations.remove(&manifest_key);
+        }
+        matches
+    }
+
+    pub fn commit_reserved_global_demotion(
+        &mut self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
+    ) -> Result<(), crate::owner_segment::OwnerTransferItemError> {
+        use crate::owner_segment::{
+            OwnerManifestKey, OwnerSlotPhysicalState, OwnerSlotScope, OwnerTargetDisposition,
+            OwnerTransferErrorCode, OwnerTransferItemError,
+        };
+
+        let segment = self.segment.as_mut().ok_or_else(|| {
+            OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Busy,
+                "owner segment allocator is not initialized",
+            )
+        })?;
+        let manifest_key = OwnerManifestKey::new(key, put_id);
+        let manifest = segment.manifest_by_key.get(&manifest_key).ok_or_else(|| {
+            OwnerTransferItemError::new(
+                OwnerTransferErrorCode::NotFound,
+                "owner manifest entry is absent while committing GlobalShared reservation",
+            )
+        })?;
+        if manifest.slot.allocation_id != allocation_id
+            || manifest.slot.segment_offset != segment_offset
+            || manifest.slot.capacity_bytes != capacity_bytes
+            || manifest.physical_state != OwnerSlotPhysicalState::Committed
+        {
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "owner manifest slot changed while committing GlobalShared reservation",
+            ));
+        }
+        if manifest.scope == Some(OwnerSlotScope::GlobalShared) {
+            segment.global_demotion_reservations.remove(&manifest_key);
+            return Ok(());
+        }
+        let reserved = segment
+            .global_demotion_reservations
+            .get(&manifest_key)
+            .is_some_and(|slot| {
+                slot.allocation_id == allocation_id
+                    && slot.segment_offset == segment_offset
+                    && slot.capacity_bytes == capacity_bytes
+            });
+        if !reserved {
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::NoSpace,
+                "GlobalShared scope commit has no exact owner budget reservation",
+            ));
+        }
+        let manifest = segment
+            .manifest_by_key
+            .get_mut(&manifest_key)
+            .expect("validated GlobalShared manifest disappeared");
+        manifest.scope = Some(OwnerSlotScope::GlobalShared);
+        manifest.disposition = OwnerTargetDisposition::GlobalShared;
+        segment.global_demotion_reservations.remove(&manifest_key);
         Ok(())
     }
 
@@ -6839,6 +9032,52 @@ impl OwnerSegmentAllocator {
             .checked_add(1)
             .expect("pending-visible slot overflow");
         true
+    }
+
+    pub fn mark_data_ready_get_target_pending_visible(
+        &mut self,
+        capability: &crate::owner_segment::OwnerTargetWriteCapability,
+    ) -> Result<(), crate::owner_segment::OwnerTransferItemError> {
+        use crate::owner_segment::{OwnerTransferErrorCode, OwnerTransferItemError};
+
+        let segment = self.segment.as_mut().ok_or_else(|| {
+            OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Busy,
+                "owner segment allocator is not initialized",
+            )
+        })?;
+        let record = segment
+            .target_leases
+            .get(&capability.operation)
+            .ok_or_else(|| {
+                OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::NotFound,
+                    "DataReady Get target lease is absent",
+                )
+            })?;
+        if record.lease_id != capability.lease_id
+            || record.slot != capability.slot
+            || !matches!(record.state, OwnerTargetLeaseState::DataReady { .. })
+            || !segment.identity_matches_desc(&capability.slot)
+            || !segment
+                .allocation(capability.slot.allocation_id)
+                .is_some_and(|allocation| matches!(allocation.state, OwnerSlotState::Prepared))
+        {
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "Get target capability no longer names the exact DataReady Prepared slot",
+            ));
+        }
+        segment.mark_prepared_slot_pending_visible(capability.slot.allocation_id);
+        self.prepared_slots = self
+            .prepared_slots
+            .checked_sub(1)
+            .expect("prepared slot counter underflow");
+        self.pending_visible_slots = self
+            .pending_visible_slots
+            .checked_add(1)
+            .expect("pending-visible slot overflow");
+        Ok(())
     }
 
     pub fn promote_pending_visible_slot_to_committed(
@@ -6978,6 +9217,13 @@ impl OwnerSegmentAllocator {
             .unwrap_or(0)
     }
 
+    pub fn physical_free_epoch(&self) -> u64 {
+        self.segment
+            .as_ref()
+            .map(|segment| segment.physical_free_epoch)
+            .unwrap_or(0)
+    }
+
     pub fn used_slot_count(&self) -> usize {
         self.prepared_slots + self.pending_visible_slots + self.committed_slots
     }
@@ -7020,6 +9266,48 @@ impl OwnerSegmentAllocator {
             .unwrap_or(0)
     }
 
+    pub fn global_accounted_bytes(&self) -> u64 {
+        self.segment
+            .as_ref()
+            .map(OwnerSegmentState::global_accounted_bytes)
+            .unwrap_or(0)
+    }
+
+    pub fn capacity_report_size_classes(&self) -> Vec<u64> {
+        let mut classes = std::collections::BTreeSet::new();
+        classes.extend(self.expected_slot_size);
+        classes.extend(self.capacity_report_requested_size_classes.iter().copied());
+        classes.extend(
+            self.pending_demand_by_slot_size
+                .iter()
+                .filter_map(|(slot_size, count)| (*count != 0).then_some(*slot_size)),
+        );
+        if let Some(segment) = self.segment.as_ref() {
+            classes.extend(segment.allocation_size_classes());
+        }
+        classes.into_iter().collect()
+    }
+
+    pub fn track_capacity_report_size_classes(
+        &mut self,
+        size_classes: &[u64],
+    ) -> Result<bool, String> {
+        for &allocation_size in size_classes {
+            if allocation_size == 0
+                || allocation_size % crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES != 0
+            {
+                return Err(format!(
+                    "master requested an invalid owner capacity size class: {}",
+                    allocation_size
+                ));
+            }
+        }
+        let before = self.capacity_report_requested_size_classes.len();
+        self.capacity_report_requested_size_classes
+            .extend(size_classes.iter().copied());
+        Ok(self.capacity_report_requested_size_classes.len() != before)
+    }
+
     pub fn pending_demand_slots(&self, slot_size: u64) -> usize {
         self.pending_demand_by_slot_size
             .get(&slot_size)
@@ -7046,31 +9334,1092 @@ impl OwnerSegmentAllocator {
 }
 
 fn owner_transfer_error(
+    terminal_sequence: u64,
     op_id: Option<crate::owner_segment::OwnerTransferOpId>,
     code: OwnerTransferErrorCode,
     detail: impl Into<String>,
 ) -> OwnerSegmentTransferItemResp {
     OwnerSegmentTransferItemResp {
+        terminal_sequence,
         op_id,
         outcome: OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(code, detail)),
     }
 }
 
+fn apply_owner_transfer_terminal_ack(
+    inner: &ClientKvApiInner,
+    caller_generation: &crate::owner_segment::OwnerGeneration,
+    ack_stream_id: u64,
+    requested_watermark: u64,
+) -> u64 {
+    if ack_stream_id == 0 || requested_watermark == 0 {
+        return 0;
+    }
+    let key = (caller_generation.clone(), ack_stream_id);
+    let applied = match inner.owner_transfer_inbound_ack_watermarks.entry(key) {
+        DashMapEntry::Occupied(mut current) => {
+            if requested_watermark > *current.get() {
+                current.insert(requested_watermark);
+            }
+            *current.get()
+        }
+        DashMapEntry::Vacant(vacant) => {
+            vacant.insert(requested_watermark);
+            requested_watermark
+        }
+    };
+    inner.owner_get_to_target_flights.retain(|op_id, flight| {
+        !(op_id.coordinator == *caller_generation
+            && flight.request.ack_stream_id == ack_stream_id
+            && flight.request.terminal_sequence <= applied
+            && flight.completed.load(Ordering::Acquire))
+    });
+    inner
+        .owner_put_from_source_flights
+        .retain(|(op_id, _), flight| {
+            !(op_id.coordinator == *caller_generation
+                && flight.request.ack_stream_id == ack_stream_id
+                && flight.request.terminal_sequence <= applied
+                && flight.completed.load(Ordering::Acquire))
+        });
+    applied
+}
+
+async fn release_owner_get_to_target_source_hold(
+    inner: &ClientKvApiInner,
+    op_id: &crate::owner_segment::OwnerTransferOpId,
+    hold: &OwnerGetToTargetSourceHold,
+    outcome: crate::owner_segment::OwnerTransferOutcome,
+) -> Result<(), String> {
+    match hold {
+        OwnerGetToTargetSourceHold::Memory(source_lease_id) => {
+            let released = inner.owner_segment_allocator.lock().release_source(
+                op_id,
+                source_lease_id,
+                outcome,
+            );
+            if matches!(released, OwnerSegmentTransferOutcome::SourceReleased) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "GetToTarget failed to release its source lease: {released:?}"
+                ))
+            }
+        }
+        OwnerGetToTargetSourceHold::Ssd { lease, get_id } => {
+            // The master SSD-stage lifecycle is replay-safe and deliberately
+            // detached. Physical transient DRAM remains protected until this
+            // exact owner slot release succeeds.
+            inner.finish_ssd_stage_detached(*get_id);
+            inner
+                .owner_release_local_reserve_slot_lease(lease.clone())
+                .await
+                .map_err(|error| format!("GetToTarget failed to release SSD staging: {error}"))
+        }
+    }
+}
+
+async fn execute_owner_get_to_target(
+    view: ClientKvApiView,
+    op_id: crate::owner_segment::OwnerTransferOpId,
+    request: OwnerGetToTargetRequest,
+    flight: &OwnerGetToTargetSharedOp,
+) -> OwnerSegmentTransferOutcome {
+    use crate::owner_segment::{
+        OwnerGetDestinationCapability, OwnerGetSourceCapability, OwnerGetTransferReceipt,
+        OwnerSegmentTransferOutcome, OwnerTransferDirection, OwnerTransferOpKind,
+        OwnerTransferOutcome,
+    };
+
+    let inner = view.client_kv_api().inner();
+    let destination = &request.destination;
+    let source_len = request.source.len();
+    if op_id.kind != OwnerTransferOpKind::Get
+        || request.source.plan_nonce() != op_id.sequence
+        || !destination.is_valid_for(&op_id, source_len)
+        || source_len == 0
+    {
+        return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+            OwnerTransferErrorCode::InvalidArgument,
+            "GetToTarget operation, source token and destination capability do not match",
+        ));
+    }
+
+    let (target_owner, target_addr, is_external_gpu) = match destination {
+        OwnerGetDestinationCapability::OwnerSlot(capability) => {
+            if capability.slot.owner != op_id.coordinator {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::InvalidArgument,
+                    "GetToTarget owner destination is not owned by the coordinator",
+                ));
+            }
+            (capability.slot.owner.clone(), capability.slot.addr, false)
+        }
+        OwnerGetDestinationCapability::ExternalGpu(capability) => {
+            (capability.requester.clone(), capability.addr, true)
+        }
+        OwnerGetDestinationCapability::Invalid => unreachable!("validated destination"),
+    };
+
+    let (exact_source, source_hold) = match &request.source {
+        OwnerGetSourceCapability::Memory(route_token) => {
+            if route_token.key.is_empty() || route_token.route_epoch == 0 {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::InvalidArgument,
+                    "GetToTarget memory source token is incomplete",
+                ));
+            }
+            match inner
+                .owner_segment_allocator
+                .lock()
+                .acquire_source(op_id.clone(), route_token.clone())
+            {
+                OwnerSegmentTransferOutcome::SourceAcquired { lease_id, slot } => {
+                    (slot, OwnerGetToTargetSourceHold::Memory(lease_id))
+                }
+                OwnerSegmentTransferOutcome::Error(error) => {
+                    return OwnerSegmentTransferOutcome::Error(error);
+                }
+                other => {
+                    return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                        OwnerTransferErrorCode::Conflict,
+                        format!("GetToTarget could not acquire its exact source: {other:?}"),
+                    ));
+                }
+            }
+        }
+        OwnerGetSourceCapability::Ssd(token) => {
+            let self_info = view.cluster_manager().get_self_info();
+            if token.key.is_empty()
+                || token.owner.node_id != self_info.id
+                || token.owner.node_start_time != self_info.node_start_time
+                || token.plan_nonce == 0
+            {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::StaleGeneration,
+                    "GetToTarget SSD source token names another owner generation",
+                ));
+            }
+            let lease = match inner
+                .owner_claim_local_reserve_slot_lease(token.len, 1)
+                .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                        OwnerTransferErrorCode::NoSpace,
+                        format!("SSD transient target claim failed: {error}"),
+                    ));
+                }
+            };
+            let slot = lease
+                .slots
+                .first()
+                .expect("one-slot SSD transient claim must be dense")
+                .clone();
+            let get_id = token.plan_nonce - 1;
+            let response = inner
+                .execute_ssd_stage(&SsdStageReadReq {
+                    key: token.key.clone(),
+                    put_id: token.put_id,
+                    get_id,
+                    stage_addr: slot.addr,
+                    stage_capacity: slot.capacity_bytes,
+                    len: token.len,
+                })
+                .await;
+            if let Err(error) = crate::rpcresp_kvresult_convert::try_from_code(
+                response.error_code,
+                response.error_json,
+            ) {
+                if let Err(release_error) = inner
+                    .owner_release_local_reserve_slot_lease(lease.clone())
+                    .await
+                {
+                    flight.retain_unreleased_source_hold(OwnerGetToTargetSourceHold::Ssd {
+                        lease,
+                        get_id,
+                    });
+                    tracing::error!(
+                        get_id,
+                        error = %release_error,
+                        "failed to release an unsuccessful SSD transient source"
+                    );
+                }
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::NotFound,
+                    format!("SSD source load failed: {error}"),
+                ));
+            }
+            (slot, OwnerGetToTargetSourceHold::Ssd { lease, get_id })
+        }
+        OwnerGetSourceCapability::Invalid => {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::InvalidArgument,
+                "GetToTarget source capability is invalid",
+            ));
+        }
+    };
+
+    let same_owner = exact_source.owner == target_owner;
+    let direction = if same_owner && exact_source.addr == target_addr {
+        OwnerTransferDirection::ZeroCopy
+    } else if same_owner {
+        OwnerTransferDirection::LocalCopy
+    } else {
+        OwnerTransferDirection::RdmaWrite
+    };
+    let transfer = if is_external_gpu {
+        view.client_transfer_engine()
+            .transfer_data_no_copy_to_remote_gpu(
+                target_owner.node_id.clone(),
+                exact_source.addr,
+                target_addr,
+                exact_source.len,
+            )
+            .await
+    } else {
+        let peer = (!same_owner).then(|| target_owner.node_id.clone());
+        view.client_transfer_engine()
+            .transfer_data_no_copy(
+                peer,
+                false,
+                exact_source.addr,
+                target_addr,
+                exact_source.len,
+                None,
+            )
+            .await
+    };
+    if let Err(error) = transfer {
+        if let Err(cleanup_error) = release_owner_get_to_target_source_hold(
+            inner,
+            &op_id,
+            &source_hold,
+            OwnerTransferOutcome::Failed,
+        )
+        .await
+        {
+            flight.retain_unreleased_source_hold(source_hold);
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Internal,
+                format!(
+                    "GetToTarget payload WRITE failed ({error}); source cleanup also failed ({cleanup_error})"
+                ),
+            ));
+        }
+        return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+            OwnerTransferErrorCode::Internal,
+            format!("GetToTarget payload WRITE failed: {error}"),
+        ));
+    }
+
+    // Transfer completion is the final access to the source range. The
+    // requester-owned Reserved target now protects the copied bytes, so source
+    // release does not require another per-Get owner RPC.
+    if let Err(cleanup_error) = release_owner_get_to_target_source_hold(
+        inner,
+        &op_id,
+        &source_hold,
+        OwnerTransferOutcome::Success,
+    )
+    .await
+    {
+        flight.retain_unreleased_source_hold(source_hold);
+        return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+            OwnerTransferErrorCode::Internal,
+            format!(
+                "GetToTarget payload WRITE completed but source cleanup failed: {cleanup_error}"
+            ),
+        ));
+    }
+
+    OwnerSegmentTransferOutcome::GetToTargetCompleted {
+        receipt: OwnerGetTransferReceipt {
+            completion_id: op_id.sequence,
+            direction,
+            bytes: exact_source.len,
+            source: exact_source.clone(),
+            destination: request.destination,
+        },
+    }
+}
+
+async fn handle_owner_get_to_target(
+    inner: &ClientKvApiInner,
+    op_id: crate::owner_segment::OwnerTransferOpId,
+    ack_stream_id: u64,
+    terminal_sequence: u64,
+    source: crate::owner_segment::OwnerGetSourceCapability,
+    destination: crate::owner_segment::OwnerGetDestinationCapability,
+) -> OwnerSegmentTransferOutcome {
+    let request = OwnerGetToTargetRequest {
+        ack_stream_id,
+        terminal_sequence,
+        source,
+        destination,
+    };
+    let (flight, leader) = match inner.owner_get_to_target_flights.entry(op_id.clone()) {
+        DashMapEntry::Occupied(existing) => {
+            if existing.get().request != request {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::Conflict,
+                    "GetToTarget replay changed source or destination capability",
+                ));
+            }
+            (existing.get().clone(), false)
+        }
+        DashMapEntry::Vacant(vacant) => {
+            let flight = OwnerGetToTargetSharedOp::new(request.clone());
+            vacant.insert(flight.clone());
+            (flight, true)
+        }
+    };
+    if leader {
+        let spawn_view = inner.view.clone_view();
+        let worker_view = spawn_view.clone();
+        let worker_flight = flight.clone();
+        let worker_op = op_id.clone();
+        spawn_view.spawn(
+            format!(
+                "owner_get_to_target_{}_{}",
+                worker_op.coordinator.node_id, worker_op.sequence
+            ),
+            async move {
+                let outcome = execute_owner_get_to_target(
+                    worker_view,
+                    worker_op,
+                    request,
+                    worker_flight.as_ref(),
+                )
+                .await;
+                assert!(
+                    worker_flight.complete(outcome),
+                    "GetToTarget leader published more than one terminal"
+                );
+            },
+        );
+    }
+    flight.wait().await
+}
+
+enum OwnerTargetRouteCommitStart {
+    Running(Arc<OwnerTargetRouteCommitSharedOp>),
+    Terminal(OwnerSegmentTransferOutcome),
+}
+
+enum OwnerTargetRouteCommitWait {
+    /// The unique route task owns the RoutePending target. The Async caller
+    /// may publish its outward acceptance without waiting for master.
+    Detached,
+    /// Either the task was already terminal or a Sync caller waited for that
+    /// same task. No second commit operation is created here.
+    Terminal(OwnerSegmentTransferOutcome),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerPutAppendDoneDisposition {
+    Committed(u64),
+    Obsolete,
+}
+
+fn classify_owner_put_append_done(
+    response: &crate::master_kv_router::msg_pack::PutAppendDoneResp,
+) -> OwnerPutAppendDoneDisposition {
+    if response.appended && response.route_epoch != 0 {
+        OwnerPutAppendDoneDisposition::Committed(response.route_epoch)
+    } else {
+        OwnerPutAppendDoneDisposition::Obsolete
+    }
+}
+
+/// An operation-state rejection is a definitive answer for this immutable
+/// route token. Replaying it cannot recreate an expired, revoked, or
+/// superseded append reservation and would otherwise retain the target slot
+/// and the per-key materialization fence forever.
+fn owner_put_append_done_is_definitively_rejected(
+    error: &crate::rpcresp_kvresult_convert::msg_and_error::KvError,
+) -> bool {
+    matches!(
+        error,
+        crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+            crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidPutMasterState { .. }
+        )
+    )
+}
+
+async fn wait_owner_target_route_commit(
+    mode: crate::owner_segment::OwnerRouteCommitMode,
+    commit: OwnerTargetRouteCommitStart,
+) -> OwnerTargetRouteCommitWait {
+    match (mode, commit) {
+        (
+            crate::owner_segment::OwnerRouteCommitMode::Async,
+            OwnerTargetRouteCommitStart::Running(_),
+        ) => OwnerTargetRouteCommitWait::Detached,
+        (
+            crate::owner_segment::OwnerRouteCommitMode::Async,
+            OwnerTargetRouteCommitStart::Terminal(terminal),
+        ) => OwnerTargetRouteCommitWait::Terminal(terminal),
+        (
+            crate::owner_segment::OwnerRouteCommitMode::Sync,
+            OwnerTargetRouteCommitStart::Running(flight),
+        ) => OwnerTargetRouteCommitWait::Terminal(flight.wait().await),
+        (
+            crate::owner_segment::OwnerRouteCommitMode::Sync,
+            OwnerTargetRouteCommitStart::Terminal(terminal),
+        ) => OwnerTargetRouteCommitWait::Terminal(terminal),
+    }
+}
+
+async fn run_owner_target_route_commit(
+    view: ClientKvApiView,
+    op_id: crate::owner_segment::OwnerTransferOpId,
+    request: OwnerTargetRouteCommitRequest,
+) -> OwnerSegmentTransferOutcome {
+    if request.route_token.is_some()
+        && op_id.kind != crate::owner_segment::OwnerTransferOpKind::ReplicaAppend
+    {
+        return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+            OwnerTransferErrorCode::RouteCommitRequired,
+            "this persistent owner transfer kind has not migrated its master route adapter",
+        ));
+    }
+    let inner = view.client_kv_api().inner();
+    let Some(route_token) = request.route_token.clone() else {
+        return inner.owner_segment_allocator.lock().finish_target_commit(
+            &op_id,
+            &request.lease_id,
+            0,
+        );
+    };
+    let key = route_token.key.clone();
+    let mut retry_delay = crate::owner_segment::OWNER_SEGMENT_TRANSFER_RETRY_INITIAL;
+    loop {
+        match inner
+            .put_append_done(
+                &key,
+                route_token.put_id,
+                route_token.operation.sequence,
+                Some(request.receipt.target.clone()),
+                Some(route_token.clone()),
+            )
+            .await
+        {
+            Ok(response) => match classify_owner_put_append_done(&response) {
+                OwnerPutAppendDoneDisposition::Committed(route_epoch) => {
+                    return inner.owner_segment_allocator.lock().finish_target_commit(
+                        &op_id,
+                        &request.lease_id,
+                        route_epoch,
+                    );
+                }
+                OwnerPutAppendDoneDisposition::Obsolete => {
+                    // The request and immutable reservation identity were already
+                    // validated by the master.  A successful response with no
+                    // appended route therefore means the exact source generation
+                    // is no longer current (or an equivalent generation fence
+                    // rejected publication). Replaying cannot make that old
+                    // generation current again. Free only this RoutePending slot
+                    // and let a later lookup observe the new route or recompute.
+                    tracing::debug!(
+                        operation_id = op_id.sequence,
+                        key,
+                        appended = response.appended,
+                        route_epoch = response.route_epoch,
+                        "CommitTarget became obsolete before route publication; aborting the exact target"
+                    );
+                    return inner
+                    .owner_segment_allocator
+                    .lock()
+                    .abort_route_rejected_target(
+                        &op_id,
+                        &request.lease_id,
+                        format!(
+                            "master route generation advanced before owner target publication: appended={} route_epoch={}",
+                            response.appended, response.route_epoch
+                        ),
+                    );
+                }
+            },
+            Err(error) if owner_put_append_done_is_definitively_rejected(&error) => {
+                tracing::warn!(
+                    operation_id = op_id.sequence,
+                    key,
+                    error = %error,
+                    "CommitTarget metadata operation was definitively rejected; aborting the exact target instead of replaying"
+                );
+                return inner
+                    .owner_segment_allocator
+                    .lock()
+                    .abort_route_rejected_target(
+                        &op_id,
+                        &request.lease_id,
+                        format!("master definitively rejected owner target publication: {error}"),
+                    );
+            }
+            Err(error) if view.register_shutdown_poller().is_running() => {
+                tracing::warn!(
+                    operation_id = op_id.sequence,
+                    key,
+                    retry_delay_ms = retry_delay.as_millis(),
+                    error = %error,
+                    "CommitTarget metadata RPC is uncertain; replaying the same route operation"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(crate::owner_segment::OWNER_SEGMENT_TRANSFER_RETRY_MAX);
+            }
+            Err(error) => {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::Internal,
+                    format!("CommitTarget stopped during shutdown: {error}"),
+                ));
+            }
+        }
+    }
+}
+
+fn start_owner_target_route_commit(
+    inner: &ClientKvApiInner,
+    op_id: crate::owner_segment::OwnerTransferOpId,
+    request: OwnerTargetRouteCommitRequest,
+) -> OwnerTargetRouteCommitStart {
+    let pending = inner.owner_segment_allocator.lock().begin_target_commit(
+        &op_id,
+        &request.lease_id,
+        request.receipt.clone(),
+        request.route_token.clone(),
+    );
+    match pending {
+        OwnerSegmentTransferOutcome::TargetCommitPending { .. } => {}
+        terminal => return OwnerTargetRouteCommitStart::Terminal(terminal),
+    }
+
+    let (flight, leader) = match inner.owner_target_route_commit_flights.entry(op_id.clone()) {
+        DashMapEntry::Occupied(existing) => {
+            if existing.get().request != request {
+                return OwnerTargetRouteCommitStart::Terminal(OwnerSegmentTransferOutcome::Error(
+                    OwnerTransferItemError::new(
+                        OwnerTransferErrorCode::Conflict,
+                        "CommitTarget replay changed lease, receipt or route token",
+                    ),
+                ));
+            }
+            (existing.get().clone(), false)
+        }
+        DashMapEntry::Vacant(vacant) => {
+            let flight = OwnerTargetRouteCommitSharedOp::new(request.clone());
+            vacant.insert(flight.clone());
+            (flight, true)
+        }
+    };
+    if leader {
+        let spawn_view = inner.view.clone_view();
+        let worker_view = spawn_view.clone();
+        let worker_flight = flight.clone();
+        let worker_op = op_id.clone();
+        spawn_view.spawn(
+            format!(
+                "owner_target_route_commit_{}_{}",
+                worker_op.coordinator.node_id, worker_op.sequence
+            ),
+            async move {
+                let terminal = run_owner_target_route_commit(worker_view, worker_op, request).await;
+                assert!(
+                    worker_flight.complete(terminal),
+                    "CommitTarget task published more than one terminal"
+                );
+            },
+        );
+    }
+    OwnerTargetRouteCommitStart::Running(flight)
+}
+
+async fn commit_owner_target_route(
+    inner: &ClientKvApiInner,
+    op_id: &crate::owner_segment::OwnerTransferOpId,
+    lease_id: &crate::owner_segment::OwnerLeaseId,
+    receipt: crate::owner_segment::OwnerTransferReceipt,
+    route_token: Option<crate::owner_segment::OwnerTargetRouteToken>,
+) -> OwnerSegmentTransferOutcome {
+    match start_owner_target_route_commit(
+        inner,
+        op_id.clone(),
+        OwnerTargetRouteCommitRequest {
+            lease_id: lease_id.clone(),
+            receipt,
+            route_token,
+            route_commit_mode: crate::owner_segment::OwnerRouteCommitMode::Sync,
+        },
+    ) {
+        OwnerTargetRouteCommitStart::Running(flight) => flight.wait().await,
+        OwnerTargetRouteCommitStart::Terminal(terminal) => terminal,
+    }
+}
+
+fn put_from_source_completed(
+    target_attempt: u32,
+    source: &crate::owner_segment::OwnerSourceReadCapability,
+    target: crate::owner_segment::OwnerSlotDesc,
+    receipt: crate::owner_segment::OwnerTransferReceipt,
+    route_epoch: u64,
+) -> OwnerSegmentTransferOutcome {
+    OwnerSegmentTransferOutcome::PutFromSourceCompleted {
+        target_attempt,
+        source: source.route.source.clone(),
+        target,
+        receipt,
+        route_epoch,
+    }
+}
+
+fn put_from_source_accepted_route_pending(
+    target_attempt: u32,
+    source: &crate::owner_segment::OwnerSourceReadCapability,
+    target: crate::owner_segment::OwnerSlotDesc,
+    receipt: crate::owner_segment::OwnerTransferReceipt,
+) -> OwnerSegmentTransferOutcome {
+    OwnerSegmentTransferOutcome::PutFromSourceAcceptedRoutePending {
+        target_attempt,
+        source: source.route.source.clone(),
+        target,
+        receipt,
+    }
+}
+
+async fn wait_owner_local_access_fence(mut completion: watch::Receiver<bool>) {
+    loop {
+        if *completion.borrow_and_update() {
+            return;
+        }
+        if completion.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn complete_put_from_existing_owner_manifest(
+    inner: &ClientKvApiInner,
+    op_id: &crate::owner_segment::OwnerTransferOpId,
+    request: &OwnerPutFromSourceRequest,
+    source_slot: &crate::owner_segment::OwnerSlotDesc,
+    target_slot: crate::owner_segment::OwnerSlotDesc,
+) -> OwnerSegmentTransferOutcome {
+    use crate::owner_segment::{OwnerTransferDirection, OwnerTransferReceipt};
+
+    let response = match inner
+        .put_append_done(
+            &request.target_plan.key,
+            request.target_plan.put_id,
+            op_id.sequence,
+            Some(target_slot.clone()),
+            Some(request.target_plan.clone()),
+        )
+        .await
+    {
+        Ok(response) if response.appended && response.route_epoch != 0 => response,
+        Ok(response) => {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::RouteCommitRequired,
+                format!(
+                    "PutFromSource could not adopt an existing exact owner manifest: appended={} route_epoch={}",
+                    response.appended, response.route_epoch
+                ),
+            ));
+        }
+        Err(error) => {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::RouteCommitRequired,
+                format!("PutFromSource existing-manifest route commit failed: {error}"),
+            ));
+        }
+    };
+    let receipt = OwnerTransferReceipt {
+        completion_id: op_id.sequence,
+        direction: OwnerTransferDirection::RdmaRead,
+        bytes: source_slot.len,
+        source: Some(source_slot.clone()),
+        target: target_slot.clone(),
+        source_registration_epoch: source_slot.segment_registration_epoch,
+        target_registration_epoch: target_slot.segment_registration_epoch,
+    };
+    match request.route_commit_mode {
+        crate::owner_segment::OwnerRouteCommitMode::Async => {
+            put_from_source_accepted_route_pending(
+                request.target_attempt,
+                &request.source,
+                target_slot,
+                receipt,
+            )
+        }
+        crate::owner_segment::OwnerRouteCommitMode::Sync => put_from_source_completed(
+            request.target_attempt,
+            &request.source,
+            target_slot,
+            receipt,
+            response.route_epoch,
+        ),
+    }
+}
+
+async fn execute_owner_put_from_source(
+    view: ClientKvApiView,
+    op_id: crate::owner_segment::OwnerTransferOpId,
+    request: OwnerPutFromSourceRequest,
+) -> OwnerSegmentTransferOutcome {
+    use crate::owner_segment::{OwnerTransferDirection, OwnerTransferOpKind, OwnerTransferReceipt};
+
+    let inner = view.client_kv_api().inner();
+    let self_info = view.cluster_manager().get_self_info();
+    let target_owner =
+        crate::owner_segment::OwnerGeneration::new(self_info.id.clone(), self_info.node_start_time);
+    let source_slot = &request.source.route.source;
+    let target_plan = &request.target_plan;
+    if op_id.kind != OwnerTransferOpKind::ReplicaAppend
+        || request.target_attempt == 0
+        || target_plan.operation != op_id
+        || target_plan.target_owner != target_owner
+        || target_plan.plan_nonce != op_id.sequence
+        || target_plan.key != request.source.route.key
+        || target_plan.put_id != request.source.route.put_id
+        || target_plan.atomic_batch != request.source.route.atomic_batch
+        || source_slot.owner == target_owner
+        || !request.source.is_valid_for(
+            &op_id,
+            &target_owner,
+            request.target_attempt,
+            source_slot.len,
+        )
+    {
+        return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+            OwnerTransferErrorCode::InvalidArgument,
+            "PutFromSource operation, source capability and target plan do not match",
+        ));
+    }
+
+    let materialization_op = loop {
+        match inner.reserve_owner_key_materialization(&target_plan.key, target_plan.put_id) {
+            OwnerKeyMaterializationReservation::Leader(op) => break op,
+            OwnerKeyMaterializationReservation::Wait(op) => {
+                let _ = op.wait().await;
+            }
+            OwnerKeyMaterializationReservation::WaitForGet(op) => {
+                op.wait_terminal().await;
+            }
+            OwnerKeyMaterializationReservation::WaitForExternalPut(op) => {
+                let _ = op.wait().await;
+            }
+            OwnerKeyMaterializationReservation::WaitForLocalAccess(completion) => {
+                wait_owner_local_access_fence(completion).await;
+            }
+        }
+    };
+    let mut materialization_guard =
+        OwnerKeyMaterializationGuard::new(view.clone(), materialization_op);
+
+    let existing_manifest = inner
+        .owner_segment_allocator
+        .lock()
+        .manifest_entry(&target_plan.key, target_plan.put_id);
+    if let Some(existing) = existing_manifest {
+        if existing.physical_state != crate::owner_segment::OwnerSlotPhysicalState::Committed {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                format!(
+                    "PutFromSource found an owner manifest without its materialization fence: state={:?} allocation_id={}",
+                    existing.physical_state, existing.slot.allocation_id
+                ),
+            ));
+        }
+        if existing.slot.owner != target_owner
+            || existing.slot.len != source_slot.len
+            || !existing.slot.is_valid()
+        {
+            return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "PutFromSource existing owner manifest has incompatible geometry",
+            ));
+        }
+        let outcome = complete_put_from_existing_owner_manifest(
+            inner,
+            &op_id,
+            &request,
+            source_slot,
+            existing.slot,
+        )
+        .await;
+        if matches!(
+            outcome,
+            OwnerSegmentTransferOutcome::PutFromSourceAcceptedRoutePending { .. }
+                | OwnerSegmentTransferOutcome::PutFromSourceCompleted { .. }
+        ) {
+            materialization_guard.finish(OwnerKeyMaterializationOutcome::Committed);
+        }
+        return outcome;
+    }
+
+    let prepared = inner.owner_segment_allocator.lock().prepare_target(
+        op_id.clone(),
+        target_owner.clone(),
+        target_plan.key.clone(),
+        target_plan.put_id,
+        source_slot.len,
+        request.disposition,
+        target_plan.atomic_batch.clone(),
+    );
+    let (lease_id, target_slot, transfer_required) = match prepared {
+        OwnerSegmentTransferOutcome::TargetPrepared { lease_id, slot, .. } => {
+            (lease_id, slot, true)
+        }
+        OwnerSegmentTransferOutcome::TargetDataReady { lease_id, slot }
+        | OwnerSegmentTransferOutcome::TargetCommitPending { lease_id, slot } => {
+            (lease_id, slot, false)
+        }
+        OwnerSegmentTransferOutcome::TargetCommitted {
+            lease_id: _,
+            slot,
+            route_epoch,
+        } if route_epoch != 0 => {
+            let receipt = OwnerTransferReceipt {
+                completion_id: op_id.sequence,
+                direction: OwnerTransferDirection::RdmaRead,
+                bytes: source_slot.len,
+                source: Some(source_slot.clone()),
+                target: slot.clone(),
+                source_registration_epoch: source_slot.segment_registration_epoch,
+                target_registration_epoch: slot.segment_registration_epoch,
+            };
+            materialization_guard.finish(OwnerKeyMaterializationOutcome::Committed);
+            return match request.route_commit_mode {
+                crate::owner_segment::OwnerRouteCommitMode::Async => {
+                    put_from_source_accepted_route_pending(
+                        request.target_attempt,
+                        &request.source,
+                        slot,
+                        receipt,
+                    )
+                }
+                crate::owner_segment::OwnerRouteCommitMode::Sync => put_from_source_completed(
+                    request.target_attempt,
+                    &request.source,
+                    slot,
+                    receipt,
+                    route_epoch,
+                ),
+            };
+        }
+        terminal => return terminal,
+    };
+
+    if target_slot.owner != target_owner
+        || target_slot.len != source_slot.len
+        || !target_slot.is_valid()
+    {
+        return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+            OwnerTransferErrorCode::Conflict,
+            "PutFromSource target claim returned invalid geometry",
+        ));
+    }
+    let receipt = OwnerTransferReceipt {
+        completion_id: op_id.sequence,
+        direction: OwnerTransferDirection::RdmaRead,
+        bytes: source_slot.len,
+        source: Some(source_slot.clone()),
+        target: target_slot.clone(),
+        source_registration_epoch: source_slot.segment_registration_epoch,
+        target_registration_epoch: target_slot.segment_registration_epoch,
+    };
+
+    if transfer_required {
+        inner.record_owner_remote_put_transfer();
+        if let Err(error) = view
+            .client_transfer_engine()
+            .transfer_data_no_copy(
+                Some(source_slot.owner.node_id.clone()),
+                true,
+                source_slot.addr,
+                target_slot.addr,
+                source_slot.len,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(
+                key = target_plan.key,
+                put_time_ms = target_plan.put_id.0,
+                put_version = target_plan.put_id.1,
+                target_attempt = request.target_attempt,
+                source_node_id = source_slot.owner.node_id,
+                target_node_id = target_owner.node_id,
+                error = %error,
+                "PutFromSource target-side RDMA READ failed"
+            );
+            return inner.owner_segment_allocator.lock().abort_target(
+                &op_id,
+                &lease_id,
+                format!("PutFromSource RDMA READ failed: {error}"),
+            );
+        }
+    }
+
+    let commit = start_owner_target_route_commit(
+        inner,
+        op_id.clone(),
+        OwnerTargetRouteCommitRequest {
+            lease_id: lease_id.clone(),
+            receipt: receipt.clone(),
+            route_token: Some(request.target_plan.clone()),
+            route_commit_mode: request.route_commit_mode,
+        },
+    );
+    if request.route_commit_mode == crate::owner_segment::OwnerRouteCommitMode::Async {
+        return match commit {
+            OwnerTargetRouteCommitStart::Running(flight) => {
+                let spawn_view = view.clone();
+                let expected_slot = target_slot.clone();
+                spawn_view.spawn("owner_key_materialization_route_wait", async move {
+                    let terminal = flight.wait().await;
+                    let outcome = match terminal {
+                        OwnerSegmentTransferOutcome::TargetCommitted {
+                            slot, route_epoch, ..
+                        } if route_epoch != 0 && slot.geometry_matches(&expected_slot) => {
+                            OwnerKeyMaterializationOutcome::Committed
+                        }
+                        _ => OwnerKeyMaterializationOutcome::Failed,
+                    };
+                    materialization_guard.finish(outcome);
+                });
+                put_from_source_accepted_route_pending(
+                    request.target_attempt,
+                    &request.source,
+                    target_slot,
+                    receipt,
+                )
+            }
+            OwnerTargetRouteCommitStart::Terminal(
+                OwnerSegmentTransferOutcome::TargetCommitted {
+                    slot, route_epoch, ..
+                },
+            ) if route_epoch != 0 && slot.geometry_matches(&target_slot) => {
+                materialization_guard.finish(OwnerKeyMaterializationOutcome::Committed);
+                put_from_source_accepted_route_pending(
+                    request.target_attempt,
+                    &request.source,
+                    slot,
+                    receipt,
+                )
+            }
+            OwnerTargetRouteCommitStart::Terminal(terminal) => terminal,
+        };
+    }
+
+    let terminal = match commit {
+        OwnerTargetRouteCommitStart::Running(flight) => flight.wait().await,
+        OwnerTargetRouteCommitStart::Terminal(terminal) => terminal,
+    };
+    match terminal {
+        OwnerSegmentTransferOutcome::TargetCommitted {
+            lease_id: committed_lease,
+            slot,
+            route_epoch,
+        } if committed_lease == lease_id
+            && slot.geometry_matches(&target_slot)
+            && route_epoch != 0 =>
+        {
+            materialization_guard.finish(OwnerKeyMaterializationOutcome::Committed);
+            put_from_source_completed(
+                request.target_attempt,
+                &request.source,
+                slot,
+                receipt,
+                route_epoch,
+            )
+        }
+        OwnerSegmentTransferOutcome::Error(OwnerTransferItemError {
+            code: OwnerTransferErrorCode::RouteCommitRequired,
+            detail,
+        }) => inner
+            .owner_segment_allocator
+            .lock()
+            .abort_route_rejected_target(
+                &op_id,
+                &lease_id,
+                format!("Sync CommitTarget failed before outward success: {detail}"),
+            ),
+        terminal => terminal,
+    }
+}
+
+async fn handle_owner_put_from_source(
+    inner: &ClientKvApiInner,
+    op_id: crate::owner_segment::OwnerTransferOpId,
+    request: OwnerPutFromSourceRequest,
+) -> OwnerSegmentTransferOutcome {
+    let key = (op_id.clone(), request.target_attempt);
+    let (flight, leader) = match inner.owner_put_from_source_flights.entry(key) {
+        DashMapEntry::Occupied(existing) => {
+            if existing.get().request != request {
+                return OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
+                    OwnerTransferErrorCode::Conflict,
+                    "PutFromSource replay changed source, target plan or attempt",
+                ));
+            }
+            (existing.get().clone(), false)
+        }
+        DashMapEntry::Vacant(vacant) => {
+            let flight = OwnerPutFromSourceSharedOp::new(request.clone());
+            vacant.insert(flight.clone());
+            (flight, true)
+        }
+    };
+    if leader {
+        let spawn_view = inner.view.clone_view();
+        let worker_view = spawn_view.clone();
+        let worker_flight = flight.clone();
+        let worker_op = op_id.clone();
+        spawn_view.spawn(
+            format!(
+                "owner_put_from_source_{}_{}_{}",
+                worker_op.coordinator.node_id, worker_op.sequence, request.target_attempt,
+            ),
+            async move {
+                let outcome = execute_owner_put_from_source(worker_view, worker_op, request).await;
+                assert!(
+                    worker_flight.complete(outcome),
+                    "PutFromSource leader published more than one terminal"
+                );
+            },
+        );
+    }
+    flight.wait().await
+}
+
 async fn handle_owner_segment_transfer_item(
     inner: &ClientKvApiInner,
     caller: &NodeID,
-    item: OwnerSegmentTransferItem,
+    caller_generation: &crate::owner_segment::OwnerGeneration,
+    ack_stream_id: u64,
+    acknowledged_watermark: u64,
+    request_item: crate::owner_segment::OwnerSegmentTransferRequestItem,
 ) -> OwnerSegmentTransferItemResp {
+    let terminal_sequence = request_item.terminal_sequence;
+    let item = request_item.item;
     let op_id = item.op_id().cloned();
     let Some(operation) = op_id.clone() else {
         return owner_transfer_error(
+            terminal_sequence,
             None,
             OwnerTransferErrorCode::InvalidArgument,
             "owner segment transfer item is invalid",
         );
     };
-    if operation.coordinator.node_id.as_str() != caller.as_ref() {
+    if operation.coordinator != *caller_generation
+        || operation.coordinator.node_id.as_str() != caller.as_ref()
+    {
         return owner_transfer_error(
+            terminal_sequence,
             op_id,
             OwnerTransferErrorCode::StaleGeneration,
             format!(
@@ -7088,6 +10437,7 @@ async fn handle_owner_segment_transfer_item(
         .is_none_or(|member| member.node_start_time != operation.coordinator.node_start_time)
     {
         return owner_transfer_error(
+            terminal_sequence,
             op_id,
             OwnerTransferErrorCode::StaleGeneration,
             format!(
@@ -7098,13 +10448,69 @@ async fn handle_owner_segment_transfer_item(
             ),
         );
     }
+    let caches_terminal = item.caches_replay_terminal();
+    if ack_stream_id == 0
+        || caches_terminal != (terminal_sequence != 0)
+        || (terminal_sequence != 0 && terminal_sequence <= acknowledged_watermark)
+    {
+        return owner_transfer_error(
+            terminal_sequence,
+            op_id,
+            OwnerTransferErrorCode::Conflict,
+            if terminal_sequence != 0 && terminal_sequence <= acknowledged_watermark {
+                format!(
+                    "owner transfer terminal was already acknowledged: stream={} sequence={} watermark={}",
+                    ack_stream_id, terminal_sequence, acknowledged_watermark
+                )
+            } else {
+                format!(
+                    "owner transfer terminal sequence is invalid: stream={} sequence={} caches_terminal={}",
+                    ack_stream_id, terminal_sequence, caches_terminal
+                )
+            },
+        );
+    }
 
     let outcome = match item {
         OwnerSegmentTransferItem::Invalid => unreachable!(),
-        OwnerSegmentTransferItem::AcquireSource { op_id, route_token } => inner
-            .owner_segment_allocator
-            .lock()
-            .acquire_source(op_id, route_token),
+        OwnerSegmentTransferItem::GetToTarget {
+            op_id,
+            source,
+            destination,
+        } => {
+            handle_owner_get_to_target(
+                inner,
+                op_id,
+                ack_stream_id,
+                terminal_sequence,
+                source,
+                destination,
+            )
+            .await
+        }
+        OwnerSegmentTransferItem::PutFromSource {
+            op_id,
+            target_attempt,
+            target_plan,
+            source,
+            disposition,
+            route_commit_mode,
+        } => {
+            handle_owner_put_from_source(
+                inner,
+                op_id,
+                OwnerPutFromSourceRequest {
+                    ack_stream_id,
+                    terminal_sequence,
+                    target_attempt,
+                    target_plan,
+                    source,
+                    disposition,
+                    route_commit_mode,
+                },
+            )
+            .await
+        }
         OwnerSegmentTransferItem::PrepareTarget {
             op_id,
             expected_target,
@@ -7122,84 +10528,12 @@ async fn handle_owner_segment_transfer_item(
             disposition,
             atomic_batch,
         ),
-        OwnerSegmentTransferItem::ReleaseSource {
-            op_id,
-            lease_id,
-            outcome,
-        } => inner
-            .owner_segment_allocator
-            .lock()
-            .release_source(&op_id, &lease_id, outcome),
         OwnerSegmentTransferItem::CommitTarget {
             op_id,
             lease_id,
             receipt,
             route_token,
-        } => {
-            if route_token.is_some()
-                && op_id.kind != crate::owner_segment::OwnerTransferOpKind::ReplicaAppend
-            {
-                OwnerSegmentTransferOutcome::Error(OwnerTransferItemError::new(
-                    OwnerTransferErrorCode::RouteCommitRequired,
-                    "this persistent owner transfer kind has not migrated its master route adapter",
-                ))
-            } else {
-                let pending = inner.owner_segment_allocator.lock().begin_target_commit(
-                    &op_id,
-                    &lease_id,
-                    receipt,
-                    route_token.clone(),
-                );
-                match pending {
-                    OwnerSegmentTransferOutcome::TargetCommitPending { slot, .. } => {
-                        if let Some(route_token) = route_token {
-                            match inner
-                                .put_append_done(
-                                    &route_token.key,
-                                    route_token.put_id,
-                                    route_token.operation.sequence,
-                                    Some(slot),
-                                    Some(route_token),
-                                )
-                                .await
-                            {
-                                Ok(response) if response.appended && response.route_epoch != 0 => {
-                                    inner.owner_segment_allocator.lock().finish_target_commit(
-                                        &op_id,
-                                        &lease_id,
-                                        response.route_epoch,
-                                    )
-                                }
-                                Ok(_) => inner
-                                    .owner_segment_allocator
-                                    .lock()
-                                    .abort_route_rejected_target(
-                                        &op_id,
-                                        &lease_id,
-                                        "master rejected owner target route publication"
-                                            .to_string(),
-                                    ),
-                                Err(error) => OwnerSegmentTransferOutcome::Error(
-                                    OwnerTransferItemError::new(
-                                        OwnerTransferErrorCode::Internal,
-                                        format!(
-                                            "master owner-target route commit is uncertain: {error}"
-                                        ),
-                                    ),
-                                ),
-                            }
-                        } else {
-                            inner.owner_segment_allocator.lock().finish_target_commit(
-                                &op_id,
-                                &lease_id,
-                                0,
-                            )
-                        }
-                    }
-                    terminal => terminal,
-                }
-            }
-        }
+        } => commit_owner_target_route(inner, &op_id, &lease_id, receipt, route_token).await,
         OwnerSegmentTransferItem::AbortTarget {
             op_id,
             lease_id,
@@ -7209,7 +10543,11 @@ async fn handle_owner_segment_transfer_item(
             .lock()
             .abort_target(&op_id, &lease_id, reason),
     };
-    OwnerSegmentTransferItemResp { op_id, outcome }
+    OwnerSegmentTransferItemResp {
+        terminal_sequence,
+        op_id,
+        outcome,
+    }
 }
 
 async fn handle_owner_segment_transfer(
@@ -7219,13 +10557,34 @@ async fn handle_owner_segment_transfer(
 ) -> MsgPack<OwnerSegmentTransferResp> {
     let started_at = Instant::now();
     let inner = view.client_kv_api().inner();
-    let items = futures::future::join_all(
-        request
-            .serialize_part
-            .items
-            .into_iter()
-            .map(|item| handle_owner_segment_transfer_item(inner, &caller, item)),
-    )
+    let caller_generation = request.serialize_part.caller_generation.clone();
+    let ack_stream_id = request.serialize_part.ack_stream_id;
+    let caller_is_current = caller_generation.node_id.as_str() == caller.as_ref()
+        && inner
+            .view
+            .cluster_manager()
+            .get_member_info_cached(caller.as_ref())
+            .is_some_and(|member| member.node_start_time == caller_generation.node_start_time);
+    let acknowledged_watermark = if caller_is_current {
+        apply_owner_transfer_terminal_ack(
+            inner,
+            &caller_generation,
+            ack_stream_id,
+            request.serialize_part.terminal_ack_watermark,
+        )
+    } else {
+        0
+    };
+    let items = futures::future::join_all(request.serialize_part.items.into_iter().map(|item| {
+        handle_owner_segment_transfer_item(
+            inner,
+            &caller,
+            &caller_generation,
+            ack_stream_id,
+            acknowledged_watermark,
+            item,
+        )
+    }))
     .await;
     inner
         .owner_local_reserve_rebalance_notify()
@@ -7235,8 +10594,7 @@ async fn handle_owner_segment_transfer(
             items,
             error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
             error_json: String::new(),
-            server_process_us: i64::try_from(started_at.elapsed().as_micros())
-                .unwrap_or(i64::MAX),
+            server_process_us: i64::try_from(started_at.elapsed().as_micros()).unwrap_or(i64::MAX),
         },
         raw_bytes: Vec::new(),
     }
@@ -7248,8 +10606,8 @@ mod owner_segment_protocol_tests {
     use crate::owner_segment::{
         OwnerGeneration, OwnerSegmentTransferOutcome, OwnerSlotPhysicalState,
         OwnerSourceRouteToken, OwnerTargetDisposition, OwnerTargetRouteToken,
-        OwnerTransferDirection, OwnerTransferErrorCode, OwnerTransferOpId, OwnerTransferOpKind,
-        OwnerTransferOutcome, OwnerTransferReceipt,
+        OwnerTargetWriteCapability, OwnerTransferDirection, OwnerTransferErrorCode,
+        OwnerTransferOpId, OwnerTransferOpKind, OwnerTransferOutcome, OwnerTransferReceipt,
     };
 
     const SEGMENT_BYTES: u64 = 64 * 1024;
@@ -7267,10 +10625,25 @@ mod owner_segment_protocol_tests {
             0x1000,
             0x1000,
             SEGMENT_BYTES,
-            SEGMENT_BYTES,
+            0,
             None,
         )
         .expect("install owner protocol test segment");
+        pool
+    }
+
+    fn pool_with_local_target(local_target_bytes: u64) -> OwnerSegmentAllocator {
+        let mut pool = OwnerSegmentAllocator::default();
+        pool.install_segment(
+            generation("target", 11),
+            11,
+            0x1000,
+            0x1000,
+            SEGMENT_BYTES,
+            local_target_bytes,
+            None,
+        )
+        .expect("install owner protocol test segment with local target");
         pool
     }
 
@@ -7280,11 +10653,12 @@ mod owner_segment_protocol_tests {
 
     fn prepared(
         outcome: OwnerSegmentTransferOutcome,
-    ) -> (crate::owner_segment::OwnerLeaseId, crate::owner_segment::OwnerSlotDesc) {
+    ) -> (
+        crate::owner_segment::OwnerLeaseId,
+        crate::owner_segment::OwnerSlotDesc,
+    ) {
         match outcome {
-            OwnerSegmentTransferOutcome::TargetPrepared { lease_id, slot, .. } => {
-                (lease_id, slot)
-            }
+            OwnerSegmentTransferOutcome::TargetPrepared { lease_id, slot, .. } => (lease_id, slot),
             other => panic!("expected prepared target, got {other:?}"),
         }
     }
@@ -7368,27 +10742,454 @@ mod owner_segment_protocol_tests {
             OwnerSegmentTransferOutcome::TargetCommitPending { .. }
         ));
         assert!(matches!(
-            pool.begin_target_commit(
-                &operation,
-                &lease_id,
-                receipt,
-                Some(route_token),
-            ),
+            pool.begin_target_commit(&operation, &lease_id, receipt, Some(route_token),),
             OwnerSegmentTransferOutcome::TargetCommitPending { .. }
         ));
         assert!(matches!(
             pool.finish_target_commit(&operation, &lease_id, 77),
-            OwnerSegmentTransferOutcome::TargetCommitted { route_epoch: 77, .. }
+            OwnerSegmentTransferOutcome::TargetCommitted {
+                route_epoch: 77,
+                ..
+            }
         ));
         assert!(matches!(
             pool.finish_target_commit(&operation, &lease_id, 77),
-            OwnerSegmentTransferOutcome::TargetCommitted { route_epoch: 77, .. }
+            OwnerSegmentTransferOutcome::TargetCommitted {
+                route_epoch: 77,
+                ..
+            }
         ));
         assert_eq!(pool.used_slot_count(), 1);
         let manifest = pool.manifest_entry("key", (100, 3)).unwrap();
         assert_eq!(manifest.slot, slot);
         assert_eq!(manifest.route_epoch, 77);
         assert_eq!(manifest.physical_state, OwnerSlotPhysicalState::Committed);
+    }
+
+    #[test]
+    fn global_target_prepare_is_hard_bounded_before_transfer() {
+        let slot_size = crate::owner_segment_allocation_capacity_bytes(VALUE_LEN).unwrap();
+        let global_target_bytes = slot_size * 2;
+        let mut pool = pool_with_local_target(SEGMENT_BYTES - global_target_bytes);
+
+        for sequence in 1..=2 {
+            assert!(matches!(
+                pool.prepare_target(
+                    op(sequence, OwnerTransferOpKind::ReplicaAppend),
+                    generation("target", 11),
+                    format!("global-{sequence}"),
+                    (100 + sequence, 1),
+                    VALUE_LEN,
+                    OwnerTargetDisposition::GlobalShared,
+                    None,
+                ),
+                OwnerSegmentTransferOutcome::TargetPrepared { .. }
+            ));
+        }
+        assert_eq!(pool.global_accounted_bytes(), global_target_bytes);
+        assert!(matches!(
+            pool.prepare_target(
+                op(3, OwnerTransferOpKind::ReplicaAppend),
+                generation("target", 11),
+                "global-3".to_string(),
+                (103, 1),
+                VALUE_LEN,
+                OwnerTargetDisposition::GlobalShared,
+                None,
+            ),
+            OwnerSegmentTransferOutcome::Error(ref error)
+                if error.code == OwnerTransferErrorCode::NoSpace
+        ));
+        assert_eq!(pool.global_accounted_bytes(), global_target_bytes);
+        assert_eq!(pool.used_slot_count(), 2);
+
+        assert!(matches!(
+            pool.prepare_target(
+                op(4, OwnerTransferOpKind::Get),
+                generation("target", 11),
+                "local-still-admitted".to_string(),
+                (104, 1),
+                VALUE_LEN,
+                OwnerTargetDisposition::LocalExclusive,
+                None,
+            ),
+            OwnerSegmentTransferOutcome::TargetPrepared { .. }
+        ));
+    }
+
+    #[test]
+    fn global_demotion_reservation_blocks_transfer_and_commits_without_double_counting() {
+        let slot_size = crate::owner_segment_allocation_capacity_bytes(VALUE_LEN).unwrap();
+        let mut pool = pool_with_local_target(SEGMENT_BYTES - slot_size);
+        let operation = op(20, OwnerTransferOpKind::ReplicaAppend);
+        let (lease_id, slot) = prepared(pool.prepare_target(
+            operation.clone(),
+            generation("target", 11),
+            "local-to-global".to_string(),
+            (200, 1),
+            VALUE_LEN,
+            OwnerTargetDisposition::LocalExclusive,
+            None,
+        ));
+        let receipt = OwnerTransferReceipt {
+            completion_id: 20,
+            direction: OwnerTransferDirection::RdmaRead,
+            bytes: VALUE_LEN,
+            source: None,
+            target: slot.clone(),
+            source_registration_epoch: 0,
+            target_registration_epoch: slot.segment_registration_epoch,
+        };
+        let route_token = OwnerTargetRouteToken {
+            key: "local-to-global".to_string(),
+            put_id: (200, 1),
+            operation: operation.clone(),
+            target_owner: generation("target", 11),
+            prior_route_epoch: 0,
+            policy_epoch: 1,
+            atomic_batch: None,
+            plan_nonce: 20,
+        };
+        assert!(matches!(
+            pool.begin_target_commit(&operation, &lease_id, receipt, Some(route_token)),
+            OwnerSegmentTransferOutcome::TargetCommitPending { .. }
+        ));
+        assert!(matches!(
+            pool.finish_target_commit(&operation, &lease_id, 20),
+            OwnerSegmentTransferOutcome::TargetCommitted { .. }
+        ));
+
+        assert!(
+            pool.try_reserve_global_demotion(
+                "local-to-global",
+                (200, 1),
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            )
+            .unwrap()
+        );
+        assert_eq!(pool.global_accounted_bytes(), slot_size);
+        assert!(
+            pool.try_reserve_global_demotion(
+                "local-to-global",
+                (200, 1),
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            )
+            .unwrap(),
+            "reservation replay must be idempotent"
+        );
+        assert_eq!(pool.global_accounted_bytes(), slot_size);
+
+        assert!(matches!(
+            pool.prepare_target(
+                op(21, OwnerTransferOpKind::ReplicaAppend),
+                generation("target", 11),
+                "remote-transfer".to_string(),
+                (201, 1),
+                VALUE_LEN,
+                OwnerTargetDisposition::GlobalShared,
+                None,
+            ),
+            OwnerSegmentTransferOutcome::Error(ref error)
+                if error.code == OwnerTransferErrorCode::NoSpace
+        ));
+
+        pool.commit_reserved_global_demotion(
+            "local-to-global",
+            (200, 1),
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        )
+        .unwrap();
+        assert_eq!(pool.global_accounted_bytes(), slot_size);
+        assert_eq!(
+            pool.manifest_entry("local-to-global", (200, 1))
+                .unwrap()
+                .disposition,
+            OwnerTargetDisposition::GlobalShared
+        );
+        assert!(!pool.release_global_demotion_reservation(
+            "local-to-global",
+            (200, 1),
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+    }
+
+    #[test]
+    fn claimed_get_target_is_operation_bound_data_ready_and_committed_in_place() {
+        let mut pool = pool();
+        let operation =
+            OwnerTransferOpId::new(generation("target", 11), 41, OwnerTransferOpKind::Get);
+        let slot = pool
+            .claim_value(VALUE_LEN, 1)
+            .pop()
+            .expect("claim requester-local Get target");
+        let (lease_id, prepared_slot) = prepared(pool.prepare_claimed_get_target(
+            operation.clone(),
+            "get-key".to_string(),
+            (300, 4),
+            None,
+            slot.clone(),
+        ));
+        assert_eq!(prepared_slot, slot);
+        assert_eq!(pool.prepared_slot_count(), 1);
+        let capability = OwnerTargetWriteCapability {
+            operation: operation.clone(),
+            lease_id: lease_id.clone(),
+            slot: slot.clone(),
+        };
+        let receipt = OwnerTransferReceipt {
+            completion_id: operation.sequence,
+            direction: OwnerTransferDirection::RdmaWrite,
+            bytes: VALUE_LEN,
+            source: None,
+            target: slot.clone(),
+            source_registration_epoch: 17,
+            target_registration_epoch: slot.segment_registration_epoch,
+        };
+        assert!(matches!(
+            pool.mark_target_data_ready(&operation, &lease_id, receipt.clone()),
+            OwnerSegmentTransferOutcome::TargetDataReady { .. }
+        ));
+        assert!(matches!(
+            pool.mark_target_data_ready(&operation, &lease_id, receipt),
+            OwnerSegmentTransferOutcome::TargetDataReady { .. }
+        ));
+        pool.mark_data_ready_get_target_pending_visible(&capability)
+            .expect("DataReady target becomes hidden resident");
+        assert_eq!(pool.prepared_slot_count(), 0);
+        assert_eq!(pool.pending_visible_slot_count(), 1);
+        assert_eq!(
+            pool.manifest_entry("get-key", (300, 4))
+                .expect("DataReady Get target manifest")
+                .physical_state,
+            OwnerSlotPhysicalState::DataReady
+        );
+        assert!(matches!(
+            pool.begin_data_ready_get_target_commit(&capability),
+            OwnerSegmentTransferOutcome::TargetCommitPending { .. }
+        ));
+        assert!(matches!(
+            pool.begin_data_ready_get_target_commit(&capability),
+            OwnerSegmentTransferOutcome::TargetCommitPending { .. }
+        ));
+        assert_eq!(
+            pool.manifest_entry("get-key", (300, 4))
+                .expect("RoutePending Get target manifest")
+                .physical_state,
+            OwnerSlotPhysicalState::RoutePending
+        );
+        assert!(matches!(
+            pool.finish_data_ready_get_target(&operation, &lease_id, slot.allocation_id),
+            OwnerSegmentTransferOutcome::TargetCommitted { .. }
+        ));
+        assert_eq!(pool.pending_visible_slot_count(), 0);
+        assert_eq!(pool.committed_slot_count(), 1);
+        let manifest = pool.manifest_entry("get-key", (300, 4)).unwrap();
+        assert_eq!(manifest.slot, slot);
+        assert_eq!(manifest.physical_state, OwnerSlotPhysicalState::Committed);
+    }
+
+    #[test]
+    fn rejected_async_get_target_keeps_caller_bytes_until_holder_drop() {
+        let mut pool = pool();
+        let operation =
+            OwnerTransferOpId::new(generation("target", 11), 42, OwnerTransferOpKind::Get);
+        let slot = pool
+            .claim_value(VALUE_LEN, 1)
+            .pop()
+            .expect("claim requester-local Get target");
+        let (lease_id, prepared_slot) = prepared(pool.prepare_claimed_get_target(
+            operation.clone(),
+            "rejected-async-get".to_string(),
+            (301, 4),
+            None,
+            slot.clone(),
+        ));
+        let capability = OwnerTargetWriteCapability {
+            operation: operation.clone(),
+            lease_id: lease_id.clone(),
+            slot: prepared_slot.clone(),
+        };
+        let receipt = OwnerTransferReceipt {
+            completion_id: operation.sequence,
+            direction: OwnerTransferDirection::RdmaWrite,
+            bytes: VALUE_LEN,
+            source: None,
+            target: prepared_slot.clone(),
+            source_registration_epoch: 17,
+            target_registration_epoch: prepared_slot.segment_registration_epoch,
+        };
+        assert!(matches!(
+            pool.mark_target_data_ready(&operation, &lease_id, receipt),
+            OwnerSegmentTransferOutcome::TargetDataReady { .. }
+        ));
+        pool.mark_data_ready_get_target_pending_visible(&capability)
+            .expect("DataReady target becomes hidden resident");
+        assert!(pool.retain_resident_slot_holder(
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+        assert!(matches!(
+            pool.begin_data_ready_get_target_commit(&capability),
+            OwnerSegmentTransferOutcome::TargetCommitPending { .. }
+        ));
+
+        assert!(matches!(
+            pool.abort_data_ready_visible_get_target(
+                &operation,
+                &lease_id,
+                "master rejected expired Get Plan".to_string(),
+            ),
+            OwnerSegmentTransferOutcome::TargetAborted
+        ));
+        assert!(matches!(
+            pool.abort_data_ready_visible_get_target(
+                &operation,
+                &lease_id,
+                "terminal replay".to_string(),
+            ),
+            OwnerSegmentTransferOutcome::TargetAborted
+        ));
+        assert_eq!(pool.used_slot_count(), 1);
+        assert_eq!(pool.pending_visible_slot_count(), 1);
+        assert_eq!(
+            pool.manifest_entry("rejected-async-get", (301, 4))
+                .expect("aborted holder remains generation-safe until drop")
+                .physical_state,
+            OwnerSlotPhysicalState::Reclaiming
+        );
+
+        assert!(pool.release_resident_slot_holder(
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+        assert_eq!(pool.used_slot_count(), 0);
+        assert_eq!(pool.pending_visible_slot_count(), 0);
+        assert_eq!(pool.total_free_bytes(), SEGMENT_BYTES);
+    }
+
+    #[test]
+    fn failed_get_target_aborts_the_exact_data_ready_prepared_slot() {
+        let mut pool = pool();
+        let operation =
+            OwnerTransferOpId::new(generation("target", 11), 42, OwnerTransferOpKind::Get);
+        let slot = pool.claim_value(VALUE_LEN, 1).pop().unwrap();
+        let (lease_id, _) = prepared(pool.prepare_claimed_get_target(
+            operation.clone(),
+            "failed-get".to_string(),
+            (301, 1),
+            None,
+            slot.clone(),
+        ));
+        let receipt = OwnerTransferReceipt {
+            completion_id: operation.sequence,
+            direction: OwnerTransferDirection::RdmaWrite,
+            bytes: VALUE_LEN,
+            source: None,
+            target: slot,
+            source_registration_epoch: 17,
+            target_registration_epoch: 11,
+        };
+        assert!(matches!(
+            pool.mark_target_data_ready(&operation, &lease_id, receipt),
+            OwnerSegmentTransferOutcome::TargetDataReady { .. }
+        ));
+        assert!(matches!(
+            pool.abort_target(&operation, &lease_id, "source failed".to_string()),
+            OwnerSegmentTransferOutcome::TargetAborted
+        ));
+        assert_eq!(pool.used_slot_count(), 0);
+        assert_eq!(pool.total_free_bytes(), SEGMENT_BYTES);
+    }
+
+    #[test]
+    fn get_target_stale_after_claim_keeps_the_claim_releasable() {
+        let mut pool = pool();
+        let claimed_target = pool.claim_value(VALUE_LEN, 1).pop().unwrap();
+        let resident = pool.claim_value(VALUE_LEN, 1).pop().unwrap();
+        assert!(pool.mark_prepared_slot_pending_visible(
+            resident.allocation_id,
+            resident.segment_offset,
+            resident.capacity_bytes,
+        ));
+        assert!(pool.promote_pending_visible_slot_to_committed(
+            resident.allocation_id,
+            resident.segment_offset,
+            resident.capacity_bytes,
+        ));
+        pool.install_committed_manifest(
+            "raced-get",
+            (302, 1),
+            resident.allocation_id,
+            crate::owner_segment::OwnerSlotScope::LocalExclusive,
+            51,
+        )
+        .unwrap();
+
+        let operation =
+            OwnerTransferOpId::new(generation("target", 11), 43, OwnerTransferOpKind::Get);
+        assert!(matches!(
+            pool.prepare_claimed_get_target(
+                operation,
+                "raced-get".to_string(),
+                (302, 1),
+                None,
+                claimed_target.clone(),
+            ),
+            OwnerSegmentTransferOutcome::Error(ref error)
+                if error.code == OwnerTransferErrorCode::StalePlan
+        ));
+        assert!(pool.release_prepared_slot(
+            claimed_target.allocation_id,
+            claimed_target.segment_offset,
+            claimed_target.capacity_bytes,
+        ));
+        assert_eq!(pool.used_slot_count(), 1);
+        assert!(pool.manifest_entry("raced-get", (302, 1)).is_some());
+    }
+
+    #[test]
+    fn ssd_transient_source_claim_has_no_route_and_requires_exact_release() {
+        let mut pool = pool();
+        let slot = pool
+            .claim_value(VALUE_LEN, 1)
+            .pop()
+            .expect("claim SSD transient source slot from the owner allocator");
+        assert_eq!(pool.total_free_bytes(), SEGMENT_BYTES - slot.capacity_bytes);
+        assert!(
+            pool.manifest_entry("ssd-source", (1, 1)).is_none(),
+            "transient SSD staging must not publish an owner route"
+        );
+        assert!(!pool.release_prepared_slot(
+            slot.allocation_id + 1,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+        assert_eq!(
+            pool.total_free_bytes(),
+            SEGMENT_BYTES - slot.capacity_bytes,
+            "a stale allocation id must not free the transient slot"
+        );
+        assert!(pool.release_prepared_slot(
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+        assert_eq!(pool.total_free_bytes(), SEGMENT_BYTES);
+        assert!(!pool.release_prepared_slot(
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
     }
 
     #[test]
@@ -7445,6 +11246,75 @@ mod owner_segment_protocol_tests {
     }
 
     #[test]
+    fn master_route_rejection_rolls_back_only_the_exact_pending_target() {
+        let mut pool = pool();
+        let operation = op(7, OwnerTransferOpKind::ReplicaAppend);
+        let (lease_id, slot) = prepared(pool.prepare_target(
+            operation.clone(),
+            generation("target", 11),
+            "route-rejected".to_string(),
+            (44, 1),
+            VALUE_LEN,
+            OwnerTargetDisposition::GlobalShared,
+            None,
+        ));
+        let receipt = OwnerTransferReceipt {
+            completion_id: 7,
+            direction: OwnerTransferDirection::RdmaWrite,
+            bytes: VALUE_LEN,
+            source: None,
+            target: slot.clone(),
+            source_registration_epoch: 0,
+            target_registration_epoch: slot.segment_registration_epoch,
+        };
+        let route_token = OwnerTargetRouteToken {
+            key: "route-rejected".to_string(),
+            put_id: (44, 1),
+            operation: operation.clone(),
+            target_owner: generation("target", 11),
+            prior_route_epoch: 0,
+            policy_epoch: 3,
+            atomic_batch: None,
+            plan_nonce: 7,
+        };
+        assert!(matches!(
+            pool.begin_target_commit(&operation, &lease_id, receipt, Some(route_token),),
+            OwnerSegmentTransferOutcome::TargetCommitPending { .. }
+        ));
+        assert!(matches!(
+            pool.abort_target(&operation, &lease_id, "unsafe generic abort".to_string()),
+            OwnerSegmentTransferOutcome::Error(ref error)
+                if error.code == OwnerTransferErrorCode::RouteCommitRequired
+        ));
+        assert!(matches!(
+            pool.abort_route_rejected_target(
+                &operation,
+                &lease_id,
+                "master rejected route".to_string(),
+            ),
+            OwnerSegmentTransferOutcome::TargetAborted
+        ));
+        assert_eq!(pool.total_free_bytes(), SEGMENT_BYTES);
+        assert!(pool.manifest_entry("route-rejected", (44, 1)).is_none());
+        assert!(matches!(
+            pool.abort_route_rejected_target(&operation, &lease_id, "replay".to_string(),),
+            OwnerSegmentTransferOutcome::TargetAborted
+        ));
+        assert!(matches!(
+            pool.prepare_target(
+                operation,
+                generation("target", 11),
+                "route-rejected".to_string(),
+                (44, 1),
+                VALUE_LEN,
+                OwnerTargetDisposition::GlobalShared,
+                None,
+            ),
+            OwnerSegmentTransferOutcome::TargetAborted
+        ));
+    }
+
+    #[test]
     fn source_lease_replay_blocks_reclaim_until_exact_release() {
         let mut pool = pool();
         let slot = pool.claim_value(VALUE_LEN, 1).pop().unwrap();
@@ -7476,7 +11346,8 @@ mod owner_segment_protocol_tests {
             plan_nonce: 5,
         };
         let operation = op(5, OwnerTransferOpKind::Get);
-        let (lease_id, acquired_slot) = match pool.acquire_source(operation.clone(), token.clone()) {
+        let (lease_id, acquired_slot) = match pool.acquire_source(operation.clone(), token.clone())
+        {
             OwnerSegmentTransferOutcome::SourceAcquired { lease_id, slot } => (lease_id, slot),
             other => panic!("expected source lease, got {other:?}"),
         };
@@ -7516,6 +11387,54 @@ mod owner_segment_protocol_tests {
             pool.release_source(&operation, &lease_id, OwnerTransferOutcome::Success),
             OwnerSegmentTransferOutcome::SourceReleased
         ));
+    }
+
+    #[test]
+    fn plan_snapshot_cannot_acquire_a_source_reclaimed_before_get_to_target() {
+        let mut pool = pool();
+        let slot = pool.claim_value(VALUE_LEN, 1).pop().unwrap();
+        assert!(pool.mark_prepared_slot_pending_visible(
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+        assert!(pool.promote_pending_visible_slot_to_committed(
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+        pool.install_committed_manifest(
+            "stale-plan-source",
+            (10, 1),
+            slot.allocation_id,
+            crate::owner_segment::OwnerSlotScope::GlobalShared,
+            51,
+        )
+        .unwrap();
+
+        let operation = op(7, OwnerTransferOpKind::Get);
+        let plan_snapshot = OwnerSourceRouteToken {
+            key: "stale-plan-source".to_string(),
+            put_id: (10, 1),
+            route_epoch: 51,
+            source: slot.clone(),
+            atomic_batch: None,
+            plan_nonce: operation.sequence,
+        };
+
+        assert!(pool.release_committed_slot_route(
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+        assert_eq!(pool.total_free_bytes(), SEGMENT_BYTES);
+        assert!(matches!(
+            pool.acquire_source(operation, plan_snapshot),
+            OwnerSegmentTransferOutcome::Error(ref error)
+                if error.code == OwnerTransferErrorCode::NotFound
+        ));
+        assert_eq!(pool.used_slot_count(), 0);
+        assert_eq!(pool.total_free_bytes(), SEGMENT_BYTES);
     }
 }
 
@@ -7605,6 +11524,7 @@ mod owner_reclaim_slot_tests {
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                owner_materialization: None,
                 local_access_fence: None,
             },
         );
@@ -7638,6 +11558,7 @@ mod owner_reclaim_slot_tests {
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                owner_materialization: None,
                 local_access_fence: None,
             },
         );
@@ -7678,6 +11599,7 @@ mod owner_reclaim_slot_tests {
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                owner_materialization: None,
                 local_access_fence: None,
             },
         );
@@ -7717,6 +11639,8 @@ mod owner_reclaim_slot_tests {
             owner_local_reserve_physical_capacity_bytes: 0,
             allocation_authority:
                 crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+            owner_placement_class:
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
             ssd_storage: None,
         })
         .await
@@ -7828,6 +11752,8 @@ mod owner_reclaim_slot_tests {
             owner_local_reserve_physical_capacity_bytes: 0,
             allocation_authority:
                 crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+            owner_placement_class:
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
             ssd_storage: None,
         })
         .await
@@ -8043,6 +11969,8 @@ mod owner_reclaim_slot_tests {
             owner_local_reserve_physical_capacity_bytes: 0,
             allocation_authority:
                 crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+            owner_placement_class:
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
             ssd_storage: None,
         })
         .await
@@ -8132,6 +12060,8 @@ mod owner_reclaim_slot_tests {
             owner_local_reserve_physical_capacity_bytes: 0,
             allocation_authority:
                 crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+            owner_placement_class:
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
             ssd_storage: None,
         })
         .await
@@ -8205,6 +12135,8 @@ mod owner_reclaim_slot_tests {
             owner_local_reserve_physical_capacity_bytes: 0,
             allocation_authority:
                 crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+            owner_placement_class:
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
             ssd_storage: Some(KvSsdStorageInit {
                 roots: vec![KvSsdStorageRootLimit {
                     root_dir: root.clone(),
@@ -8272,6 +12204,7 @@ mod owner_reclaim_slot_tests {
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                owner_materialization: None,
                 local_access_fence: None,
             },
         );
@@ -8305,6 +12238,7 @@ mod owner_reclaim_slot_tests {
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: None,
+                owner_materialization: None,
                 local_access_fence: None,
             },
         );
@@ -8461,6 +12395,12 @@ mod owner_reclaim_slot_tests {
             ExternalLocalFirstPutKeyReservation::Wait(_) => {
                 panic!("the first same-key Put cannot be a follower")
             }
+            ExternalLocalFirstPutKeyReservation::WaitForMaterialization(_) => {
+                panic!("the first same-key Put has no owner materialization to join")
+            }
+            ExternalLocalFirstPutKeyReservation::WaitForGet(_) => {
+                panic!("the first same-key Put has no Get leader to join")
+            }
             ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(_) => {
                 panic!("an unfenced key cannot wait for local access")
             }
@@ -8472,6 +12412,12 @@ mod owner_reclaim_slot_tests {
             ExternalLocalFirstPutKeyReservation::Wait(waiter) => waiter,
             ExternalLocalFirstPutKeyReservation::Leader(_) => {
                 panic!("the second same-key Put must not claim a second leader fence")
+            }
+            ExternalLocalFirstPutKeyReservation::WaitForMaterialization(_) => {
+                panic!("a local-Put follower must not wait for an absent materialization")
+            }
+            ExternalLocalFirstPutKeyReservation::WaitForGet(_) => {
+                panic!("a local-Put follower must not wait for an absent Get")
             }
             ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(_) => {
                 panic!("a local-Put follower must wait on the leader result")
@@ -8552,6 +12498,12 @@ mod owner_reclaim_slot_tests {
             }
             ExternalLocalFirstPutKeyReservation::Wait(_) => {
                 panic!("a source-fenced key has no local-Put leader to join")
+            }
+            ExternalLocalFirstPutKeyReservation::WaitForMaterialization(_) => {
+                panic!("a source-fenced key has no owner materialization to join")
+            }
+            ExternalLocalFirstPutKeyReservation::WaitForGet(_) => {
+                panic!("a source-fenced key has no owner Get to join")
             }
         };
         let second_rollback_waiter = match inner
@@ -8738,6 +12690,7 @@ mod owner_reclaim_slot_tests {
                 key: key.to_string(),
                 put_id: (identity.put_time_ms, identity.put_version),
                 backing: OwnerReclaimBacking::Allocation,
+                global_demotion_reserved: false,
                 ssd_backing_len: None,
                 ssd_policy: OwnerSourceSsdPolicy::Drop,
             },
@@ -8992,6 +12945,7 @@ mod owner_reclaim_slot_tests {
                     ..OwnerReclaimItem::default()
                 })),
                 external_get: None,
+                owner_materialization: None,
                 local_access_fence: Some(::tokio::sync::watch::channel(false).0),
             },
         );
@@ -9235,25 +13189,11 @@ mod owner_reclaim_slot_tests {
     fn owner_segment_is_installed_once_and_never_detached() {
         let mut pool = OwnerSegmentAllocator::default();
         assert!(
-            pool.install_test_segment(
-                "allocator-test-owner",
-                0,
-                0,
-                16 * 1024,
-                12 * 1024,
-                None,
-            )
+            pool.install_test_segment("allocator-test-owner", 0, 0, 16 * 1024, 12 * 1024, None,)
                 .is_ok()
         );
         assert!(
-            pool.install_test_segment(
-                "allocator-test-owner",
-                0,
-                0,
-                16 * 1024,
-                8 * 1024,
-                None,
-            )
+            pool.install_test_segment("allocator-test-owner", 0, 0, 16 * 1024, 8 * 1024, None,)
                 .is_err()
         );
         assert_eq!(pool.physical_capacity_bytes(), 16 * 1024);
@@ -9274,6 +13214,30 @@ mod owner_reclaim_slot_tests {
         assert_eq!(pool.controller_epoch, 2);
         assert_eq!(pool.local_target_bytes, 8 * 1024);
         assert_eq!(pool.apply_target_control(3, 4 * 1024), Ok(true));
+    }
+
+    #[test]
+    fn capacity_report_size_classes_merge_master_interest_without_reservation() {
+        let mut pool = OwnerSegmentAllocator::default();
+        pool.install_test_segment("allocator-test-owner", 0, 0, 32 * 1024, 0, Some(4 * 1024))
+            .unwrap();
+        assert_eq!(pool.capacity_report_size_classes(), vec![4 * 1024]);
+        assert_eq!(pool.total_free_bytes(), 32 * 1024);
+
+        assert_eq!(
+            pool.track_capacity_report_size_classes(&[12 * 1024, 8 * 1024]),
+            Ok(true)
+        );
+        assert_eq!(
+            pool.capacity_report_size_classes(),
+            vec![4 * 1024, 8 * 1024, 12 * 1024]
+        );
+        assert_eq!(pool.total_free_bytes(), 32 * 1024);
+        assert_eq!(
+            pool.track_capacity_report_size_classes(&[8 * 1024]),
+            Ok(false)
+        );
+        assert!(pool.track_capacity_report_size_classes(&[123]).is_err());
     }
 }
 
@@ -10745,6 +14709,7 @@ impl ClientKvApi {
             owner_hot_cache_capacity_bytes,
             owner_local_reserve_physical_capacity_bytes,
             allocation_authority,
+            owner_placement_class,
             ssd_storage,
         } = arg;
         let ssd_storage = match ssd_storage {
@@ -10785,6 +14750,7 @@ impl ClientKvApi {
             test_spec_config,
             owner_local_reserve_physical_capacity_bytes,
             allocation_authority,
+            owner_placement_class,
             ssd_storage,
             metrics: OnceLock::new(),
             all_memholder_refcount: OnceLock::new(),
@@ -10832,6 +14798,13 @@ impl ClientKvApi {
                 .time_to_live(Duration::from_secs(120))
                 .build(),
             ssd_stage_flights: DashMap::new(),
+            owner_get_to_target_flights: DashMap::new(),
+            owner_put_from_source_flights: DashMap::new(),
+            owner_target_route_commit_flights: DashMap::new(),
+            owner_transfer_peer_tracker: OwnerTransferPeerTracker::new(
+                OWNER_TRANSFER_CLIENT_ACK_STREAM,
+            ),
+            owner_transfer_inbound_ack_watermarks: DashMap::new(),
             completed_ssd_stages: moka::future::Cache::builder()
                 .time_to_live(SSD_STAGE_TERMINAL_TTL)
                 .build(),
@@ -10872,13 +14845,14 @@ impl ClientKvApi {
             rpc_caller_get_meta: RPCCaller::new(),
             rpc_caller_allocate_client_lease: RPCCaller::new(),
             rpc_caller_client_lease_keepalive: RPCCaller::new(),
-            rpc_caller_ssd_stage_read: RPCCaller::new(),
             rpc_caller_ssd_stage_begin: RPCCaller::new(),
             rpc_caller_ssd_stage_done: RPCCaller::new(),
             rpc_caller_external_put_commit: RPCCaller::new(),
             rpc_caller_external_put_revoke: RPCCaller::new(),
             rpc_caller_resolve_side_transfer_lane: RPCCaller::new(),
             rpc_caller_owner_segment_transfer: RPCCaller::new(),
+            rpc_caller_owner_capacity_report: RPCCaller::new(),
+            owner_capacity_report_epoch: AtomicU64::new(0),
             default_lease_id: parking_lot::RwLock::new(None),
             owner_local_publish_tx,
             owner_local_publish_rx: Mutex::new(Some(owner_local_publish_rx)),
@@ -10960,9 +14934,6 @@ impl ClientKvApi {
             .regist(inner.view.p2p_module());
         inner.rpc_caller_get_meta.regist(inner.view.p2p_module());
         inner
-            .rpc_caller_ssd_stage_read
-            .regist(inner.view.p2p_module());
-        inner
             .rpc_caller_ssd_stage_begin
             .regist(inner.view.p2p_module());
         inner
@@ -10979,6 +14950,9 @@ impl ClientKvApi {
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_owner_segment_transfer
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_owner_capacity_report
             .regist(inner.view.p2p_module());
         crate::key_prefix::init_for_p2p_owner(inner.view.p2p_module());
         crate::kvlease::init_for_p2p_owner(inner.view.p2p_module());
@@ -11008,53 +14982,6 @@ impl ClientKvApi {
                 Ok(())
             },
         );
-
-        let view_ssd = inner.view.clone_view();
-        RPCHandler::<SsdStageReadReq>::new().regist(inner.view.p2p_module(), move |resp, msg| {
-            let view = view_ssd.clone();
-            let task_view = view.clone();
-            view.spawn("rpc_ssd_stage_read", async move {
-                let get_id = msg.serialize_part.get_id;
-                let peer = resp.node_id();
-                let task_id = resp.task_id();
-                let result = handle_ssd_stage_read(&task_view, &msg).await;
-                let inner = task_view.client_kv_api().inner();
-                inner
-                    .ssd_stage_counters
-                    .response_send_attempts
-                    .fetch_add(1, Ordering::Relaxed);
-                let send_started_at = Instant::now();
-                let send_result = resp
-                    .send_resp_with_transport_policy(result, RpcTransportPolicy::ForceTransport)
-                    .await;
-                inner
-                    .ssd_stage_counters
-                    .response_send_duration_us
-                    .fetch_add(
-                        u64::try_from(send_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
-                        Ordering::Relaxed,
-                    );
-                if let Err(err) = send_result {
-                    inner
-                        .ssd_stage_counters
-                        .response_send_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        get_id,
-                        peer = %peer,
-                        task_id,
-                        error = ?err,
-                        "SSD stage-ready response send failed"
-                    );
-                } else {
-                    inner
-                        .ssd_stage_counters
-                        .response_send_successes
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            });
-            Ok(())
-        });
 
         // External RPC handlers
         let view_ext = inner.view.clone_view();
@@ -11146,7 +15073,12 @@ impl ClientKvApi {
                 let view_task = view.clone();
                 view.spawn("rpc_external_execute_planned_get", async move {
                     let result = handle_external_execute_planned_get(&view_task, &msg).await;
-                    let _ = resp.send_resp(result).await;
+                    if let Err(error) = send_control_plane_rpc_response(&resp, result).await {
+                        warn!(
+                            "Failed to send ExternalExecutePlannedGetResp over control transport: {:?}",
+                            error
+                        );
+                    }
                 });
                 Ok(())
             },

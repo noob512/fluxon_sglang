@@ -95,6 +95,8 @@ const INFLIGHT_PUT_TTL_SECONDS_SKIP_PUT_END_COMMIT: u64 = 5;
 // closed-runtime data plane well beyond one RPC timeout under burst load. Keep
 // the master operation identity alive long enough for Done/Revoke to close it.
 const INFLIGHT_REPLICA_TASK_TTL_SECONDS: u64 = 5 * 60;
+const OWNER_SOURCE_RECLAIM_REPLAY_TTL_SECONDS: u64 = 10 * 60;
+const OWNER_SOURCE_RECLAIM_REPLAY_MAX_ENTRIES: u64 = 262_144;
 const POST_ROUTE_MAINTENANCE_QUEUE_CAPACITY: usize = 512;
 const TIER1_WRITEBACK_QUEUE_CAPACITY: usize = 4096;
 pub const NODE_POOL_CAPACITY_USER_RPC_PATH: &str = "fluxon_kv/node_pool_capacity";
@@ -340,6 +342,8 @@ pub struct ReplicaCacheNodeObserveSnapshot {
     pub pool_capacity_epoch: u64,
     pub entries: u64,
     pub weighted_bytes: u64,
+    pub resident_weighted_bytes: u64,
+    pub resident_overshoot_bytes: u64,
     pub effective_capacity_bytes: u64,
     pub reserved_capacity_bytes: u64,
     pub base_capacity_bytes: u64,
@@ -585,11 +589,33 @@ pub struct InflightReplicaTaskInfo {
     pub key: String,
     pub put_id: PutIDForAKey,
     pub len: u64,
+    /// Immutable atomic publication identity captured when this replica
+    /// operation is reserved.  Start replays and Done validation must use
+    /// this snapshot instead of re-reading a route that may have advanced to
+    /// a newer generation while the target performs its transfer.
+    pub atomic_batch: Option<Arc<PutAtomicGroup>>,
     /// Protect the source-owner copy only after this inclusive replica has been
     /// published successfully.  Backend-admitted replicas set this bit; tiered
     /// write-back and owner-hot exclusive demotion deliberately do not.
     pub protect_source_on_remote_complete: bool,
     pub(crate) _activity_lease: Arc<MasterKeyActivityLease>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OwnerPlacementCandidate {
+    pub owner: crate::owner_segment::OwnerGeneration,
+    pub placement_class: crate::master_seg_manager::msg_pack::OwnerPlacementClass,
+    pub capacity_report_epoch: u64,
+    pub weight_bytes: u64,
+    pub rank: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct OwnerPlacementPlan {
+    pub policy_epoch: u64,
+    pub capacity_snapshot_id: u64,
+    pub allocation_size_bytes: u64,
+    pub candidates: Vec<OwnerPlacementCandidate>,
 }
 
 #[derive(Clone)]
@@ -602,9 +628,7 @@ pub enum InflightReplicaTarget {
         target_allocation: Arc<Mutex<Option<Allocation>>>,
     },
     /// Ordered placement hints only. The target owner performs the real claim.
-    OwnerCandidates {
-        candidates: Vec<crate::owner_segment::OwnerGeneration>,
-    },
+    OwnerCandidates { plan: OwnerPlacementPlan },
 }
 
 #[derive(Clone, Debug)]
@@ -627,8 +651,10 @@ pub struct InflightGetInfo {
     pub src_addr: u64,
     pub src_base_addr: u64,
     pub source_kind: crate::master_kv_router::msg_pack::GetSourceKind,
-    /// Registered source staging owned by the master only for SSD reads.
-    pub ssd_source_allocation: Option<Arc<Allocation>>,
+    /// Exact owner-managed source selected for this operation. Transitional
+    /// master Allocation and SSD staging sources leave this empty.
+    pub source_route_token: Option<crate::owner_segment::OwnerSourceRouteToken>,
+    pub ssd_source_route_token: Option<crate::owner_segment::OwnerSsdSourceRouteToken>,
     pub(crate) ssd_stage_lifecycle: Option<Arc<SsdStageLifecycle>>,
     pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
     pub target: InflightGetTarget,
@@ -727,6 +753,8 @@ pub struct PlannedGetInfo {
     pub src_addr: u64,
     pub src_base_addr: u64,
     pub source_kind: crate::master_kv_router::msg_pack::GetSourceKind,
+    pub source_route_token: Option<crate::owner_segment::OwnerSourceRouteToken>,
+    pub ssd_source_route_token: Option<crate::owner_segment::OwnerSsdSourceRouteToken>,
     pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
 }
 
@@ -831,6 +859,39 @@ pub(crate) struct EvictionReclaimCounters {
     pub post_read_duplicate_enqueued_bytes: AtomicU64,
     pub post_read_duplicate_reclaimed_items: AtomicU64,
     pub post_read_duplicate_reclaimed_bytes: AtomicU64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct OwnerSourceReclaimOperationIdentity {
+    pub owner_node_id: NodeIDString,
+    pub owner_node_start_time: i64,
+    pub operation_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSourceGlobalReclaimTerminal {
+    pub requested_bytes: u64,
+    pub selected_bytes: u64,
+}
+
+fn select_owner_global_reclaim_once(
+    terminals: &moka::sync::Cache<
+        OwnerSourceReclaimOperationIdentity,
+        OwnerSourceGlobalReclaimTerminal,
+    >,
+    identity: OwnerSourceReclaimOperationIdentity,
+    requested_bytes: u64,
+    select: impl FnOnce(u64) -> u64,
+) -> Result<OwnerSourceGlobalReclaimTerminal, u64> {
+    let terminal = terminals.get_with(identity, || OwnerSourceGlobalReclaimTerminal {
+        requested_bytes,
+        selected_bytes: select(requested_bytes),
+    });
+    if terminal.requested_bytes == requested_bytes {
+        Ok(terminal)
+    } else {
+        Err(terminal.requested_bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2091,7 +2152,10 @@ mod tests {
 
         terminals.insert(
             (key.clone(), put_id.0, put_id.1, first_operation_id),
-            CompletedReplicaTaskInfo { appended: true },
+            CompletedReplicaTaskInfo {
+                appended: true,
+                route_epoch: 7,
+            },
         );
 
         assert!(
@@ -2106,6 +2170,40 @@ mod tests {
                 .is_none(),
             "an old terminal result must not complete a later remote-copy attempt"
         );
+    }
+
+    #[test]
+    fn owner_global_reclaim_selection_replays_without_a_second_pop() {
+        let terminals = moka::sync::Cache::builder()
+            .time_to_live(Duration::from_secs(120))
+            .build();
+        let identity = OwnerSourceReclaimOperationIdentity {
+            owner_node_id: "owner".to_string(),
+            owner_node_start_time: 17,
+            operation_id: 41,
+        };
+        let calls = AtomicU64::new(0);
+
+        let first = select_owner_global_reclaim_once(&terminals, identity.clone(), 64, |bytes| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            bytes + 8
+        })
+        .expect("first operation selects GlobalShared victims");
+        let replay = select_owner_global_reclaim_once(&terminals, identity.clone(), 64, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            u64::MAX
+        })
+        .expect("same operation replays its selection terminal");
+
+        assert_eq!(first.selected_bytes, 72);
+        assert_eq!(replay, first);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            select_owner_global_reclaim_once(&terminals, identity, 32, |_| u64::MAX),
+            Err(64),
+            "one operation identity cannot change its requested reclaim bytes"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     fn test_memory_replica(node_id: &str) -> KvMemoryReplica {
@@ -2999,6 +3097,11 @@ pub struct MasterKvRouterInner {
     pub get_done_locks: AMapLock<u64>,
     pub(crate) key_activity: Arc<MasterKeyActivityTable>,
     pub(crate) prepared_get_requesters: Arc<PreparedGetRequesterTable>,
+    /// Makes the explicit GlobalShared pop idempotent across transport retries
+    /// of one owner source-eviction operation.  Victim route deletion remains
+    /// generation-fenced by the existing per-key reclaim state machine.
+    pub(crate) owner_source_global_reclaim_terminals:
+        moka::sync::Cache<OwnerSourceReclaimOperationIdentity, OwnerSourceGlobalReclaimTerminal>,
 
     /// Cache for holding get operations (owned, flattened by (node_id, holder_id))
     pub get_holding: MasterOwnerMemMgr,
@@ -3229,13 +3332,23 @@ impl MasterKvRouter {
                  inflight_info: InflightReplicaTaskInfo,
                  cause| {
                     if cause == RemovalCause::Expired {
+                        let target_node_id = match &inflight_info.target {
+                            InflightReplicaTarget::MasterAllocation { node_id, .. } => {
+                                node_id.as_ref()
+                            }
+                            InflightReplicaTarget::OwnerCandidates { plan } => plan
+                                .candidates
+                                .first()
+                                .map(|candidate| candidate.owner.node_id.as_str())
+                                .unwrap_or("<none>"),
+                        };
                         warn!(
                             key = %identity.0,
                             put_time_ms = identity.1,
                             put_version = identity.2,
                             operation_id = inflight_info.operation_id,
                             source_node_id = %inflight_info.source_node_id,
-                            target_node_id = %inflight_info.node_id,
+                            target_node_id,
                             ttl_seconds = INFLIGHT_REPLICA_TASK_TTL_SECONDS,
                             "inflight replica append expired before terminal Done/Revoke"
                         );
@@ -3246,6 +3359,10 @@ impl MasterKvRouter {
             .build();
         let completed_replica_tasks = moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(120))
+            .build();
+        let owner_source_global_reclaim_terminals = moka::sync::Cache::builder()
+            .max_capacity(OWNER_SOURCE_RECLAIM_REPLAY_MAX_ENTRIES)
+            .time_to_live(Duration::from_secs(OWNER_SOURCE_RECLAIM_REPLAY_TTL_SECONDS))
             .build();
         // A synchronous Moka listener must perform only constant-size metadata
         // work and must never block or drop an Allocation reclaim event.  The
@@ -3274,6 +3391,7 @@ impl MasterKvRouter {
             get_done_locks: AMapLock::new(Duration::from_secs(10 * 60)),
             key_activity,
             prepared_get_requesters,
+            owner_source_global_reclaim_terminals,
             get_holding: MasterOwnerMemMgr::default(),
             next_get_id: AtomicU64::new(0),
             next_holder_id: AtomicU64::new(0),
@@ -6608,6 +6726,7 @@ impl MasterKvRouter {
                 .node_writeback_tier1_controller
                 .get(owner_node.as_str())
                 .map(|entry| entry.value().clone());
+            let resident_weighted_bytes = cache.resident_weighted_size();
             replica_cache_nodes.push(ReplicaCacheNodeObserveSnapshot {
                 owner_node: owner_node.clone(),
                 owner_node_start_time,
@@ -6620,6 +6739,9 @@ impl MasterKvRouter {
                 pool_capacity_epoch: pool_capacity.capacity_epoch,
                 entries: cache.entry_count(),
                 weighted_bytes: cache.weighted_size(),
+                resident_weighted_bytes,
+                resident_overshoot_bytes: resident_weighted_bytes
+                    .saturating_sub(effective_capacity_bytes),
                 effective_capacity_bytes,
                 reserved_capacity_bytes,
                 base_capacity_bytes,
@@ -6933,10 +7055,12 @@ impl MasterKvRouter {
                                 node.pool_available_capacity_bytes,
                             );
                             tracing::info!(
-                                "replica cache runtime: owner={} entries={} weighted_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_victims={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} last_route_removed_members={} last_route_removed_bytes={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={} post_read_duplicate_enqueued_items={} post_read_duplicate_enqueued_bytes={} post_read_duplicate_reclaimed_items={} post_read_duplicate_reclaimed_bytes={}",
+                                "replica cache runtime: owner={} entries={} weighted_bytes={} resident_weighted_bytes={} resident_overshoot_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_victims={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} last_route_removed_members={} last_route_removed_bytes={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={} post_read_duplicate_enqueued_items={} post_read_duplicate_enqueued_bytes={} post_read_duplicate_reclaimed_items={} post_read_duplicate_reclaimed_bytes={}",
                                 node.owner_node,
                                 node.entries,
                                 node.weighted_bytes,
+                                node.resident_weighted_bytes,
+                                node.resident_overshoot_bytes,
                                 node.effective_capacity_bytes,
                                 node.base_capacity_bytes,
                                 node.reserved_capacity_bytes,

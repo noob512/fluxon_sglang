@@ -93,6 +93,8 @@ pub enum MsgId {
     OwnerLocalReserveControlResp = 3082,
     OwnerSegmentTransferReq = 3083,
     OwnerSegmentTransferResp = 3084,
+    OwnerCapacityReportReq = 3085,
+    OwnerCapacityReportResp = 3086,
     ExternalGetReq = 4001,
     ExternalGetResp = 4002,
     ExternalPutStartReq = 4003,

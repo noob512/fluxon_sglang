@@ -3,15 +3,15 @@ use super::{
     KvNodeReplicas, MasterKeyActivityCompletionGuard, MasterKvRouterView, OwnerHoldingGetInfo,
     PostReadRemoteReclaimCandidate, ReservedCapacityReason,
     msg_pack::{
-        BatchGetBindItemReq, BatchGetBindReq, BatchGetBindResp, BatchGetDoneItemResp,
-        BatchGetDoneReq, BatchGetDoneResp, BatchGetPlanItemResp, BatchGetPlanReq, BatchGetPlanResp,
-        BatchGetRevokeItemResp, BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp,
-        BatchGetStartReq, BatchGetStartResp, BatchIsExistReq, BatchIsExistResp, GetAllocationMode,
-        GetBindTarget, GetDoneReq, GetDoneResp, GetExternalSinkTarget, GetMetaReq, GetMetaResp,
-        GetPreparedLocalReserveTarget, GetRevokeReq, GetRevokeResp, GetSourceKind, GetStartReq,
-        GetStartResp, MemHolderKeepAliveReq, MemHolderKeepAliveResp, MemHolderReleaseReq,
-        MemHolderReleaseResp, SsdStageBeginReq, SsdStageBeginResp, SsdStageDoneReq,
-        SsdStageDoneResp,
+        BatchGetBindItemReq, BatchGetBindReq, BatchGetBindResp, BatchGetDoneItemReq,
+        BatchGetDoneItemResp, BatchGetDoneReq, BatchGetDoneResp, BatchGetPlanItemResp,
+        BatchGetPlanReq, BatchGetPlanResp, BatchGetRevokeItemResp, BatchGetRevokeReq,
+        BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp,
+        BatchIsExistReq, BatchIsExistResp, GetAllocationMode, GetBindTarget, GetDoneReq,
+        GetDoneResp, GetExternalSinkTarget, GetMetaReq, GetMetaResp, GetPreparedLocalReserveTarget,
+        GetRevokeReq, GetRevokeResp, GetSourceKind, GetStartReq, GetStartResp,
+        MemHolderKeepAliveReq, MemHolderKeepAliveResp, MemHolderReleaseReq, MemHolderReleaseResp,
+        PutAtomicGroup, SsdStageBeginReq, SsdStageBeginResp, SsdStageDoneReq, SsdStageDoneResp,
     },
     node_generation_is_current_live, publish_route_replica_tomb_fenced,
     route_maintenance::{RoutePublishEvent, apply_post_route_maintenance_batch},
@@ -111,7 +111,11 @@ fn validate_prepared_local_reserve_target(
     let current_owner = view
         .cluster_manager()
         .get_member_info_cached(req_node_id.as_ref())
-        .ok_or_else(|| invalid(format!("prepared owner Get target owner is absent: {req_node_id}")))?;
+        .ok_or_else(|| {
+            invalid(format!(
+                "prepared owner Get target owner is absent: {req_node_id}"
+            ))
+        })?;
     if target.owner.node_id.as_str() != req_node_id.as_ref()
         || target.owner.node_start_time != current_owner.node_start_time
         || target.len != value_len
@@ -253,6 +257,7 @@ struct PlannedGetSourceSnapshot {
     memory_is_allocation: bool,
     memory_is_committed_slot: bool,
     owner_local_indexed: bool,
+    owner_slot: Option<CommittedSlotReplica>,
 }
 
 fn planned_get_source_rank(
@@ -286,6 +291,10 @@ fn snapshot_live_get_sources(route: &OneKvNodesRoutes) -> Vec<PlannedGetSourceSn
                 return None;
             }
             if let Some(memory) = replicas.memory.as_ref() {
+                let owner_slot = match &memory.backing {
+                    super::KvReplicaBacking::CommittedSlot(slot) => Some(slot.clone()),
+                    super::KvReplicaBacking::Allocation(_) => None,
+                };
                 return Some(PlannedGetSourceSnapshot {
                     node_id: node_id.clone(),
                     tomb_tag: replicas.tomb_tag.clone(),
@@ -302,6 +311,7 @@ fn snapshot_live_get_sources(route: &OneKvNodesRoutes) -> Vec<PlannedGetSourceSn
                         super::KvReplicaBacking::CommittedSlot(_)
                     ),
                     owner_local_indexed: memory.owner_local_indexed,
+                    owner_slot,
                 });
             }
             replicas.ssd.as_ref().map(|ssd| PlannedGetSourceSnapshot {
@@ -314,9 +324,63 @@ fn snapshot_live_get_sources(route: &OneKvNodesRoutes) -> Vec<PlannedGetSourceSn
                 memory_is_allocation: false,
                 memory_is_committed_slot: false,
                 owner_local_indexed: false,
+                owner_slot: None,
             })
         })
         .collect()
+}
+
+fn owner_source_route_token(
+    key: &str,
+    put_id: PutIDForAKey,
+    atomic_batch: Option<PutAtomicGroup>,
+    get_id: u64,
+    slot: Option<&CommittedSlotReplica>,
+) -> Option<crate::owner_segment::OwnerSourceRouteToken> {
+    let slot = slot?.clone();
+    Some(crate::owner_segment::OwnerSourceRouteToken {
+        key: key.to_string(),
+        put_id,
+        // Owner-managed routes currently publish the exact allocation id as
+        // their generation-safe route epoch. Scope conversion keeps it.
+        route_epoch: slot.allocation_id,
+        source: slot,
+        atomic_batch,
+        // get_id may start at zero; owner lease identities require non-zero.
+        plan_nonce: get_id.checked_add(1).expect("master Get id overflow"),
+    })
+}
+
+fn owner_ssd_source_route_token(
+    view: &MasterKvRouterView,
+    owner: &NodeID,
+    key: &str,
+    put_id: PutIDForAKey,
+    len: u64,
+    atomic_batch: Option<PutAtomicGroup>,
+    get_id: u64,
+) -> Option<crate::owner_segment::OwnerSsdSourceRouteToken> {
+    if view
+        .master_seg_manager()
+        .get_node_allocation_authority(owner)
+        != Some(crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Owner)
+    {
+        return None;
+    }
+    let member = view
+        .cluster_manager()
+        .get_member_info_cached(owner.as_ref())?;
+    Some(crate::owner_segment::OwnerSsdSourceRouteToken {
+        key: key.to_string(),
+        put_id,
+        owner: crate::owner_segment::OwnerGeneration::new(
+            owner.to_string(),
+            member.node_start_time,
+        ),
+        len,
+        atomic_batch,
+        plan_nonce: get_id.checked_add(1).expect("master Get id overflow"),
+    })
 }
 
 fn planned_source_requester_local_borrow_eligible(
@@ -361,16 +425,15 @@ fn planned_get_requester_local_target(
     planned: &super::PlannedGetInfo,
     requester: &NodeID,
     get_id: u64,
-) -> Result<(InflightGetTarget, NodeTombTag, GetAllocationMode), msg_and_error::KvError> {
-    let invalid = |detail: String| {
-        msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument { detail })
-    };
-    if planned.source_kind != GetSourceKind::Memory || planned.src_node_id != *requester {
-        return Err(invalid(format!(
-            "requester-local source bind does not match the plan: get source={} requester={} kind={:?}",
-            planned.src_node_id, requester, planned.source_kind
-        )));
-    }
+) -> Result<
+    (
+        InflightGetTarget,
+        NodeTombTag,
+        GetAllocationMode,
+        super::PlannedGetInfo,
+    ),
+    msg_and_error::KvError,
+> {
     let route = view
         .master_kv_router()
         .inner()
@@ -378,47 +441,122 @@ fn planned_get_requester_local_target(
         .get(&planned.key)
         .map(|route| route.clone())
         .ok_or_else(|| {
-            invalid(format!(
-                "requester-local source route disappeared: key={}",
-                planned.key
-            ))
+            msg_and_error::KvError::Api(msg_and_error::ApiError::StaleGetPlan {
+                get_id,
+                key: planned.key.clone(),
+                detail: "requester-local source route disappeared before Bind".to_string(),
+            })
         })?;
-    if !planned_get_source_is_current(planned, &route) {
+    planned_get_requester_local_target_from_route(planned, &route, requester, get_id)
+}
+
+/// Revalidate requester-local backing at Bind time instead of treating Plan
+/// as an allocation reservation.  A remote Plan may legitimately age across
+/// a LocalExclusive -> GlobalShared demotion; if the same put generation is
+/// now present on the requester, Bind changes the effective source to that
+/// exact slot and keeps the operation metadata-only.
+fn planned_get_requester_local_target_from_route(
+    planned: &super::PlannedGetInfo,
+    route: &Arc<OneKvNodesRoutes>,
+    requester: &NodeID,
+    get_id: u64,
+) -> Result<
+    (
+        InflightGetTarget,
+        NodeTombTag,
+        GetAllocationMode,
+        super::PlannedGetInfo,
+    ),
+    msg_and_error::KvError,
+> {
+    let invalid = |detail: String| {
+        msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument { detail })
+    };
+    if route.put_id != planned.put_id {
         return Err(msg_and_error::KvError::Api(
             msg_and_error::ApiError::StaleGetPlan {
                 get_id,
                 key: planned.key.clone(),
-                detail: "requester-local source changed before Bind".to_string(),
+                detail: "requester-local generation changed before Bind".to_string(),
             },
         ));
     }
     let replicas = route.node_replicas.read();
     let node_replicas = replicas.get(requester).ok_or_else(|| {
-        invalid(format!(
-            "requester-local source replica disappeared: key={} requester={}",
-            planned.key, requester
-        ))
-    })?;
-    let tomb_tag = node_replicas.tomb_tag.clone();
-    let (target, allocation_mode) = match node_replicas.memory.as_ref() {
-        Some(memory) => match &memory.backing {
-            super::KvReplicaBacking::Allocation(allocation) => (
-                InflightGetTarget::Allocation(allocation.clone()),
-                GetAllocationMode::RequesterLocalBorrow,
+        msg_and_error::KvError::Api(msg_and_error::ApiError::StaleGetPlan {
+            get_id,
+            key: planned.key.clone(),
+            detail: format!(
+                "requester-local source replica disappeared before Bind: requester={requester}"
             ),
+        })
+    })?;
+    if node_replicas.tomb_tag.is_tomb() {
+        return Err(msg_and_error::KvError::Api(
+            msg_and_error::ApiError::StaleGetPlan {
+                get_id,
+                key: planned.key.clone(),
+                detail: "requester-local owner generation is tombed".to_string(),
+            },
+        ));
+    }
+    let tomb_tag = node_replicas.tomb_tag.clone();
+    let atomic_group = route.atomic_group.as_deref().cloned();
+    let (target, allocation_mode, src_addr, src_base_addr, source_route_token) = match node_replicas
+        .memory
+        .as_ref()
+    {
+        Some(memory) => match &memory.backing {
+            super::KvReplicaBacking::Allocation(allocation) if allocation.size() == planned.len => {
+                (
+                    InflightGetTarget::Allocation(allocation.clone()),
+                    GetAllocationMode::RequesterLocalBorrow,
+                    allocation.base_addr() + allocation.addr(),
+                    allocation.base_addr(),
+                    None,
+                )
+            }
             super::KvReplicaBacking::CommittedSlot(slot)
                 if !memory.owner_local_indexed
                     && slot.owner.node_id.as_str() == requester.as_ref() =>
             {
+                if slot.len != planned.len || !slot.is_valid() {
+                    return Err(invalid(format!(
+                        "requester-local GlobalShared slot geometry changed: key={} requester={} planned_len={} actual_len={}",
+                        planned.key, requester, planned.len, slot.len
+                    )));
+                }
+                let source_route_token = owner_source_route_token(
+                    &planned.key,
+                    route.put_id,
+                    atomic_group.clone(),
+                    get_id,
+                    Some(slot),
+                )
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "requester-local GlobalShared slot has no owner source token: key={} requester={}",
+                        planned.key, requester
+                    ))
+                })?;
                 (
                     InflightGetTarget::ReusedCommittedSlot(slot.clone()),
                     GetAllocationMode::RequesterLocalPromote,
+                    slot.addr,
+                    slot.base_addr,
+                    Some(source_route_token),
                 )
             }
             super::KvReplicaBacking::CommittedSlot(_) => {
                 return Err(invalid(format!(
                     "requester-local CommittedSlot is not a GlobalShared slot owned by the requester: key={} requester={}",
                     planned.key, requester
+                )));
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "requester-local source length changed: key={} requester={} planned_len={}",
+                    planned.key, requester, planned.len
                 )));
             }
         },
@@ -429,7 +567,31 @@ fn planned_get_requester_local_target(
             )));
         }
     };
-    Ok((target, tomb_tag, allocation_mode))
+    let rebound = super::PlannedGetInfo {
+        put_id: route.put_id,
+        src_node_id: requester.clone(),
+        src_tomb_tag: tomb_tag.clone(),
+        key: planned.key.clone(),
+        controller_node_id: planned.controller_node_id.clone(),
+        controller_node_start_time: planned.controller_node_start_time,
+        len: planned.len,
+        src_addr,
+        src_base_addr,
+        source_kind: GetSourceKind::Memory,
+        source_route_token,
+        ssd_source_route_token: None,
+        atomic_group,
+    };
+    if !planned_get_source_is_current(&rebound, route) {
+        return Err(msg_and_error::KvError::Api(
+            msg_and_error::ApiError::StaleGetPlan {
+                get_id,
+                key: planned.key.clone(),
+                detail: "requester-local source changed during Bind".to_string(),
+            },
+        ));
+    }
+    Ok((target, tomb_tag, allocation_mode, rebound))
 }
 
 /// Change one exact owner-managed slot from GlobalShared to LocalExclusive.
@@ -473,50 +635,19 @@ fn promote_global_shared_committed_slot(
     })
 }
 
-fn allocate_ssd_source_stage(
-    view: &MasterKvRouterView,
-    source_node_id: &NodeID,
-    len: u64,
-) -> Result<Arc<Allocation>, msg_and_error::KvError> {
-    let allocators = view
-        .master_seg_manager()
-        .get_node_allocators(source_node_id);
-    if allocators.is_empty() {
-        return Err(msg_and_error::KvError::Unreachable(
-            msg_and_error::UnreachableError::OwnerNoSeg {
-                detail: format!("SSD source owner has no registered segment: {source_node_id}"),
-            },
-        ));
-    }
-    let allocator = allocators
-        .choose(&mut rand::thread_rng())
-        .expect("non-empty SSD source allocators");
-    for _ in 0..3 {
-        if let Ok(allocation) = allocator.allocate(len) {
-            return Ok(Arc::new(allocation));
-        }
-    }
-    let capacity = allocator.node_pool_capacity_snapshot();
-    Err(msg_and_error::KvError::Api(
-        msg_and_error::ApiError::NoSpace {
-            node: source_node_id.to_string(),
-            segment: allocator.seg_device_id.clone(),
-            total_capacity: capacity.active_capacity_bytes,
-            free_capacity: capacity.available_capacity_bytes,
-        },
-    ))
-}
-
 #[cfg(test)]
 mod planned_get_tests {
     use super::{
-        planned_get_source_is_current, planned_get_source_rank,
-        planned_source_requester_local_borrow_eligible, promote_global_shared_committed_slot,
-        snapshot_live_get_sources,
+        late_bind_target_for_done, owner_source_route_token,
+        planned_get_requester_local_target_from_route, planned_get_source_is_current,
+        planned_get_source_rank, planned_source_requester_local_borrow_eligible,
+        promote_global_shared_committed_slot, snapshot_live_get_sources,
     };
     use crate::cluster_manager::NodeID;
     use crate::config::SsdReadSourcePolicy;
-    use crate::master_kv_router::msg_pack::GetSourceKind;
+    use crate::master_kv_router::msg_pack::{
+        BatchGetDoneItemReq, GetBindTarget, GetExternalSinkTarget, GetSourceKind,
+    };
     use crate::master_kv_router::{
         CommittedSlotReplica, KvMemoryReplica, KvNodeReplicas, KvReplicaBacking, KvSsdReplica,
         OneKvNodesRoutes, PlannedGetInfo,
@@ -572,6 +703,8 @@ mod planned_get_tests {
             src_addr: 0x3000,
             src_base_addr: 0x1000,
             source_kind: GetSourceKind::Memory,
+            source_route_token: None,
+            ssd_source_route_token: None,
             atomic_group: None,
         };
         (planned, route, source_tag)
@@ -628,6 +761,23 @@ mod planned_get_tests {
         });
         source_tag.set_tomb();
         assert!(!planned_get_source_is_current(&planned, &route));
+    }
+
+    #[test]
+    fn owner_source_token_uses_exact_slot_and_nonzero_first_get_nonce() {
+        let (_planned, route, _source_tag) = planned_route();
+        let source = snapshot_live_get_sources(&route)
+            .into_iter()
+            .next()
+            .expect("owner source snapshot");
+        let slot = source.owner_slot.expect("committed owner slot");
+        let token = owner_source_route_token("key", route.put_id, None, 0, Some(&slot))
+            .expect("owner source token");
+        assert_eq!(token.key, "key");
+        assert_eq!(token.put_id, route.put_id);
+        assert_eq!(token.route_epoch, slot.allocation_id);
+        assert_eq!(token.source, slot);
+        assert_eq!(token.plan_nonce, 1);
     }
 
     #[test]
@@ -797,6 +947,60 @@ mod planned_get_tests {
     }
 
     #[test]
+    fn stale_remote_plan_rebinds_to_current_requester_global_shared_slot() {
+        let (planned, route, _) = planned_route();
+        let requester: NodeID = "requester-owner".to_string().into();
+        let requester_tag = NodeTombTag::new();
+        let requester_slot = CommittedSlotReplica {
+            owner: crate::owner_segment::OwnerGeneration::new(requester.as_ref().to_string(), 23),
+            allocation_id: 22,
+            segment_offset: 4 * 8192,
+            capacity_bytes: 8192,
+            addr: 0x9000,
+            len: planned.len,
+            base_addr: 0x1000,
+            segment_registration_epoch: 2,
+        };
+        route.node_replicas.write().insert(
+            requester.clone(),
+            KvNodeReplicas::memory(
+                requester_tag.clone(),
+                KvMemoryReplica {
+                    backing: KvReplicaBacking::CommittedSlot(requester_slot.clone()),
+                    owner_local_indexed: false,
+                    get_durable_reservation: None,
+                    capacity_reservation: None,
+                },
+            ),
+        );
+
+        let (target, tomb_tag, mode, rebound) =
+            planned_get_requester_local_target_from_route(&planned, &route, &requester, 41)
+                .expect("the same put generation must late-bind to requester-local GlobalShared");
+        assert!(tomb_tag.same_generation(&requester_tag));
+        assert_eq!(
+            mode,
+            crate::master_kv_router::msg_pack::GetAllocationMode::RequesterLocalPromote
+        );
+        let super::InflightGetTarget::ReusedCommittedSlot(target_slot) = target else {
+            panic!("late rebind must reuse the existing committed owner slot")
+        };
+        assert_eq!(target_slot, requester_slot);
+        assert_ne!(planned.src_node_id, requester);
+        assert_eq!(rebound.src_node_id, requester);
+        assert_eq!(rebound.src_addr, requester_slot.addr);
+        assert_eq!(rebound.src_base_addr, requester_slot.base_addr);
+        assert_eq!(rebound.source_kind, GetSourceKind::Memory);
+        let token = rebound
+            .source_route_token
+            .as_ref()
+            .expect("owner GlobalShared rebind must carry an exact source token");
+        assert_eq!(token.source, requester_slot);
+        assert_eq!(token.plan_nonce, 42);
+        assert!(planned_get_source_is_current(&rebound, &route));
+    }
+
+    #[test]
     fn ssd_read_source_policies_have_distinct_explicit_orders() {
         let order = |policy| {
             let classes = vec![
@@ -835,6 +1039,30 @@ mod planned_get_tests {
             None,
             "remote SSD must not be a fallback for the local-only policy"
         );
+    }
+
+    #[test]
+    fn completed_done_replay_skips_late_bind_but_preserves_pending_target() {
+        let item = BatchGetDoneItemReq {
+            get_id: 9,
+            late_target: Some(GetBindTarget::ExternalSink(GetExternalSinkTarget {
+                addr: 0x1000,
+                capacity: 4096,
+                registration_id: 3,
+                requester_node_start_time: 17,
+            })),
+        };
+        assert!(matches!(
+            late_bind_target_for_done(&item, false),
+            Some(GetBindTarget::ExternalSink(target)) if target.registration_id == 3
+        ));
+        assert!(late_bind_target_for_done(&item, true).is_none());
+
+        let pre_bound = BatchGetDoneItemReq {
+            get_id: 10,
+            late_target: None,
+        };
+        assert!(late_bind_target_for_done(&pre_bound, false).is_none());
     }
 }
 
@@ -972,11 +1200,40 @@ async fn handle_get_plan_item(
         .next_get_id
         .fetch_add(1, Ordering::Relaxed);
     let gpu_direct_eligible = source.source_kind == GetSourceKind::Memory
+        && source.owner_slot.is_some()
         && local_owner
             .as_deref()
             .is_none_or(|owner| source.node_id.as_ref() != owner);
     let requester_local_borrow_eligible =
         planned_source_requester_local_borrow_eligible(&source, local_owner.as_deref());
+    let atomic_group = route.atomic_group.as_deref().cloned();
+    let source_route_token = owner_source_route_token(
+        &key,
+        route.put_id,
+        atomic_group.clone(),
+        get_id,
+        source.owner_slot.as_ref(),
+    );
+    let ssd_source_route_token = (source.source_kind == GetSourceKind::Ssd)
+        .then(|| {
+            owner_ssd_source_route_token(
+                &view,
+                &source.node_id,
+                &key,
+                route.put_id,
+                source.len,
+                atomic_group.clone(),
+                get_id,
+            )
+        })
+        .flatten();
+    if source.source_kind == GetSourceKind::Ssd && ssd_source_route_token.is_none() {
+        return get_plan_item_error(&msg_and_error::KvError::Api(
+            msg_and_error::ApiError::NodeNotFound {
+                desc: source.node_id.to_string(),
+            },
+        ));
+    }
     let planned = super::PlannedGetInfo {
         put_id: route.put_id,
         src_node_id: source.node_id.clone(),
@@ -988,7 +1245,9 @@ async fn handle_get_plan_item(
         src_addr: source.addr,
         src_base_addr: source.base_addr,
         source_kind: source.source_kind,
-        atomic_group: route.atomic_group.as_deref().cloned(),
+        source_route_token: source_route_token.clone(),
+        ssd_source_route_token: ssd_source_route_token.clone(),
+        atomic_group,
     };
     drop(route);
     view.master_kv_router()
@@ -1009,6 +1268,8 @@ async fn handle_get_plan_item(
         src_base_addr: planned.src_base_addr,
         len: planned.len,
         source_kind: planned.source_kind,
+        source_route_token,
+        ssd_source_route_token,
         atomic_group: planned.atomic_group,
         gpu_direct_eligible,
         requester_local_borrow_eligible,
@@ -1061,6 +1322,8 @@ fn bound_get_start_item(get_id: u64, info: &InflightGetInfo) -> BatchGetStartIte
         src_base_addr: info.src_base_addr,
         len: info.len,
         source_kind: info.source_kind,
+        source_route_token: info.source_route_token.clone(),
+        ssd_source_route_token: info.ssd_source_route_token.clone(),
         prepared_target: match &info.target {
             InflightGetTarget::PreparedLocalReserveSlot(slot) => Some(slot.clone()),
             _ => None,
@@ -1123,6 +1386,7 @@ async fn handle_get_bind_item(
             }),
         );
     };
+    let mut bound_planned = planned.clone();
     let (target, target_tomb_tag, allocation_mode, prepared_requester_lease) = match &request.target
     {
         GetBindTarget::ExternalSink(target) => {
@@ -1217,11 +1481,25 @@ async fn handle_get_bind_item(
                     }),
                 );
             }
-            let (target, tomb_tag, allocation_mode) =
+            let (target, tomb_tag, allocation_mode, rebound) =
                 match planned_get_requester_local_target(&view, &planned, &req_node_id, get_id) {
                     Ok(value) => value,
                     Err(err) => return get_bind_item_error(get_id, &err),
                 };
+            if rebound.src_node_id != planned.src_node_id
+                || rebound.src_addr != planned.src_addr
+                || rebound.src_base_addr != planned.src_base_addr
+                || rebound.source_kind != planned.source_kind
+            {
+                tracing::info!(
+                    get_id,
+                    key = %planned.key,
+                    planned_source = %planned.src_node_id,
+                    rebound_source = %rebound.src_node_id,
+                    "GetBind rebound a stale Plan to the current requester-local backing"
+                );
+            }
+            bound_planned = rebound;
             (target, Some(tomb_tag), allocation_mode, None)
         }
         GetBindTarget::Invalid => {
@@ -1252,10 +1530,10 @@ async fn handle_get_bind_item(
         .master_kv_router()
         .inner()
         .kv_routes
-        .get(&planned.key)
+        .get(&bound_planned.key)
         .map(|route| route.clone());
     let Some(current_route) =
-        current_route.filter(|route| planned_get_source_is_current(&planned, route))
+        current_route.filter(|route| planned_get_source_is_current(&bound_planned, route))
     else {
         view.master_kv_router()
             .inner()
@@ -1266,10 +1544,10 @@ async fn handle_get_bind_item(
             get_id,
             &msg_and_error::KvError::Api(msg_and_error::ApiError::StaleGetPlan {
                 get_id,
-                key: planned.key.clone(),
+                key: bound_planned.key.clone(),
                 detail: format!(
                     "source route changed before Bind: source={}",
-                    planned.src_node_id
+                    bound_planned.src_node_id
                 ),
             }),
         );
@@ -1286,29 +1564,20 @@ async fn handle_get_bind_item(
             &msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
                 detail: format!(
                     "prepared GetBind cannot replace a live owner replica: get_id={} key={} owner={}",
-                    get_id, planned.key, req_node_id
+                    get_id, bound_planned.key, req_node_id
                 ),
             }),
         );
     }
 
-    let (src_addr, src_base_addr, ssd_source_allocation) = match planned.source_kind {
-        GetSourceKind::Memory => (planned.src_addr, planned.src_base_addr, None),
-        GetSourceKind::Ssd => {
-            let allocation =
-                match allocate_ssd_source_stage(&view, &planned.src_node_id, planned.len) {
-                    Ok(allocation) => allocation,
-                    Err(err) => return get_bind_item_error(get_id, &err),
-                };
-            (
-                allocation.base_addr() + allocation.addr(),
-                allocation.base_addr(),
-                Some(allocation),
-            )
-        }
+    let (src_addr, src_base_addr) = match bound_planned.source_kind {
+        GetSourceKind::Memory => (bound_planned.src_addr, bound_planned.src_base_addr),
+        // The SSD owner claims transient DRAM inside GetToTarget. Master must
+        // not allocate or publish a physical staging address.
+        GetSourceKind::Ssd => (0, 0),
     };
 
-    let Some(planned) = view
+    let Some(removed_planned) = view
         .master_kv_router()
         .inner()
         .planned_gets
@@ -1322,20 +1591,31 @@ async fn handle_get_bind_item(
             }),
         );
     };
+    if removed_planned.put_id != planned.put_id || removed_planned.key != planned.key {
+        return get_bind_item_error(
+            get_id,
+            &msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                detail: format!("planned Get identity changed during Bind: get_id={get_id}"),
+            }),
+        );
+    }
+    let touch_source_kind = bound_planned.source_kind;
+    let touch_key = bound_planned.key.clone();
     let inflight = InflightGetInfo {
-        put_id: planned.put_id,
-        src_node_id: planned.src_node_id.clone(),
-        key: planned.key.clone(),
+        put_id: bound_planned.put_id,
+        src_node_id: bound_planned.src_node_id.clone(),
+        key: bound_planned.key.clone(),
         req_node_id: req_node_id.clone(),
-        controller_node_id: Some(planned.controller_node_id),
-        len: planned.len,
+        controller_node_id: Some(bound_planned.controller_node_id),
+        len: bound_planned.len,
         src_addr,
         src_base_addr,
-        source_kind: planned.source_kind,
-        ssd_source_allocation,
-        ssd_stage_lifecycle: (planned.source_kind == GetSourceKind::Ssd)
+        source_kind: bound_planned.source_kind,
+        source_route_token: bound_planned.source_route_token,
+        ssd_source_route_token: bound_planned.ssd_source_route_token,
+        ssd_stage_lifecycle: (bound_planned.source_kind == GetSourceKind::Ssd)
             .then(|| Arc::new(super::SsdStageLifecycle::new())),
-        atomic_group: planned.atomic_group,
+        atomic_group: bound_planned.atomic_group,
         target,
         target_tomb_tag,
         route: current_route.clone(),
@@ -1363,8 +1643,8 @@ async fn handle_get_bind_item(
         .planned_get_counters
         .bind_succeeded
         .fetch_add(1, Ordering::Relaxed);
-    if current_route.lease_id.is_none() && planned.source_kind == GetSourceKind::Memory {
-        touch_moka_for_node(view, response.node_id.to_string(), planned.key);
+    if current_route.lease_id.is_none() && touch_source_kind == GetSourceKind::Memory {
+        touch_moka_for_node(view, response.node_id.to_string(), touch_key);
     }
     response
 }
@@ -1578,17 +1858,21 @@ pub async fn handle_get_start(
             continue;
         }
         let src_node_id = selected_replica_key;
-        let (src_len, src_abs_addr, src_base, ssd_source_allocation) = match source_kind {
+        let (src_len, src_abs_addr, src_base, selected_owner_slot) = match source_kind {
             GetSourceKind::Memory => {
                 let selected_replica = selected_replicas
                     .memory
                     .as_ref()
                     .expect("memory source candidate must retain memory");
+                let owner_slot = match &selected_replica.backing {
+                    super::KvReplicaBacking::CommittedSlot(slot) => Some(slot.clone()),
+                    super::KvReplicaBacking::Allocation(_) => None,
+                };
                 (
                     selected_replica.backing.len(),
                     selected_replica.backing.abs_addr(),
                     selected_replica.backing.base_addr(),
-                    None,
+                    owner_slot,
                 )
             }
             GetSourceKind::Ssd => {
@@ -1596,23 +1880,7 @@ pub async fn handle_get_start(
                     .ssd
                     .as_ref()
                     .expect("SSD source candidate must retain SSD");
-                let allocation = match allocate_ssd_source_stage(&view, &src_node_id, ssd.len) {
-                    Ok(allocation) => allocation,
-                    Err(err) => {
-                        return failed_resp_err(
-                            err,
-                            Some((tombs.clone(), one_kv_nodes_routes.put_id)),
-                            &view,
-                            &req.serialize_part.key,
-                        );
-                    }
-                };
-                (
-                    ssd.len,
-                    allocation.base_addr() + allocation.addr(),
-                    allocation.base_addr(),
-                    Some(allocation),
-                )
+                (ssd.len, 0, 0, None)
             }
         };
 
@@ -1700,42 +1968,62 @@ pub async fn handle_get_start(
                     allocation_mode = GetAllocationMode::ExternalSink;
                     InflightGetTarget::ExternalSink(external_sink_target.clone())
                 } else if let Some(prepared_target) = prepared_target.as_ref() {
-                    if replicas.get(&req_node_id).is_some_and(|replicas| {
-                        !replicas.tomb_tag.is_tomb() && replicas.memory.is_some()
-                    }) {
-                        let err = msg_and_error::KvError::Api(
-                            msg_and_error::ApiError::InvalidArgument {
-                                detail: format!(
-                                    "prepared local-reserve Get target cannot replace a live replica: key={} requester={}",
-                                    req.serialize_part.key, req_node_id
-                                ),
-                            },
-                        );
-                        return failed_resp_err(
-                            err,
-                            Some((tombs.clone(), one_kv_nodes_routes.put_id)),
-                            &view,
-                            &req.serialize_part.key,
-                        );
-                    }
-                    let (slot, _prepared_tomb_tag) = match validate_prepared_local_reserve_target(
-                        &view,
-                        &req_node_id,
-                        prepared_target,
-                        src_len,
-                    ) {
-                        Ok(slot) => slot,
-                        Err(err) => {
-                            return failed_resp_err(
-                                err,
-                                Some((tombs.clone(), one_kv_nodes_routes.put_id)),
-                                &view,
-                                &req.serialize_part.key,
-                            );
+                    // Local probing and BatchGetStart are intentionally not one
+                    // distributed critical section. A concurrent Put or Get may
+                    // publish this generation on the requester after the probe
+                    // but before the master consumes the newly claimed target.
+                    if let Some(replica_on_recv_node) = replicas
+                        .get(&req_node_id)
+                        .filter(|replicas| !replicas.tomb_tag.is_tomb())
+                        .and_then(|replicas| replicas.memory.as_ref())
+                    {
+                        match &replica_on_recv_node.backing {
+                            super::KvReplicaBacking::Allocation(allocation) => {
+                                allocation_mode = GetAllocationMode::ReuseReplica;
+                                InflightGetTarget::Allocation(allocation.clone())
+                            }
+                            super::KvReplicaBacking::CommittedSlot(slot)
+                                if !replica_on_recv_node.owner_local_indexed
+                                    && slot.owner.node_id.as_str() == req_node_id.as_ref() =>
+                            {
+                                allocation_mode = GetAllocationMode::RequesterLocalPromote;
+                                InflightGetTarget::ReusedCommittedSlot(slot.clone())
+                            }
+                            super::KvReplicaBacking::CommittedSlot(_) => {
+                                let err = msg_and_error::KvError::Api(
+                                    msg_and_error::ApiError::KeyAlreadyExists {
+                                        key: req.serialize_part.key.clone(),
+                                    },
+                                );
+                                return failed_resp_err(
+                                    err,
+                                    Some((tombs.clone(), one_kv_nodes_routes.put_id)),
+                                    &view,
+                                    &req.serialize_part.key,
+                                );
+                            }
                         }
-                    };
-                    allocation_mode = GetAllocationMode::LocalCommittedSlot;
-                    InflightGetTarget::PreparedLocalReserveSlot(slot)
+                    } else {
+                        let (slot, _prepared_tomb_tag) =
+                            match validate_prepared_local_reserve_target(
+                                &view,
+                                &req_node_id,
+                                prepared_target,
+                                src_len,
+                            ) {
+                                Ok(slot) => slot,
+                                Err(err) => {
+                                    return failed_resp_err(
+                                        err,
+                                        Some((tombs.clone(), one_kv_nodes_routes.put_id)),
+                                        &view,
+                                        &req.serialize_part.key,
+                                    );
+                                }
+                            };
+                        allocation_mode = GetAllocationMode::LocalCommittedSlot;
+                        InflightGetTarget::PreparedLocalReserveSlot(slot)
+                    }
                 } else if let Some(replica_on_recv_node) = replicas
                     .get(&req_node_id)
                     .filter(|replicas| !replicas.tomb_tag.is_tomb())
@@ -1748,16 +2036,17 @@ pub async fn handle_get_start(
                         }
                         super::KvReplicaBacking::CommittedSlot(slot)
                             if !replica_on_recv_node.owner_local_indexed
-                            && slot.owner.node_id.as_str() == req_node_id.as_ref() =>
+                                && slot.owner.node_id.as_str() == req_node_id.as_ref() =>
                         {
                             allocation_mode = GetAllocationMode::RequesterLocalPromote;
                             InflightGetTarget::ReusedCommittedSlot(slot.clone())
                         }
-                        super::KvReplicaBacking::CommittedSlot(_) => match allocate_request_target()
-                        {
-                            Ok(allocation) => allocation,
-                            Err(resp) => return resp,
-                        },
+                        super::KvReplicaBacking::CommittedSlot(_) => {
+                            match allocate_request_target() {
+                                Ok(allocation) => allocation,
+                                Err(resp) => return resp,
+                            }
+                        }
                     }
                 } else {
                     match allocate_request_target() {
@@ -1822,23 +2111,54 @@ pub async fn handle_get_start(
         let target_base = target.base_addr();
 
         // If we reuse existing target on requesting node, declare src=target on req node
-        let (resp_node_id, resp_src_addr, resp_target_addr, resp_src_base, resp_target_base) =
-            if matches!(
-                allocation_mode,
-                GetAllocationMode::ReuseReplica | GetAllocationMode::RequesterLocalPromote
-            ) {
-                let addr = target.abs_addr();
-                // both src/target are on requesting node's allocation in this reuse case
-                (req_node_id.clone(), addr, addr, target_base, target_base)
-            } else {
-                (
-                    src_node_id.clone(),
-                    src_abs_addr,
-                    target.abs_addr(),
-                    src_base,
-                    target_base,
+        let (resp_node_id, resp_src_addr, resp_target_addr, resp_src_base, resp_target_base) = if matches!(
+            allocation_mode,
+            GetAllocationMode::ReuseReplica | GetAllocationMode::RequesterLocalPromote
+        ) {
+            let addr = target.abs_addr();
+            // both src/target are on requesting node's allocation in this reuse case
+            (req_node_id.clone(), addr, addr, target_base, target_base)
+        } else {
+            (
+                src_node_id.clone(),
+                src_abs_addr,
+                target.abs_addr(),
+                src_base,
+                target_base,
+            )
+        };
+
+        let actual_owner_source = match (&target, allocation_mode) {
+            (
+                InflightGetTarget::ReusedCommittedSlot(slot),
+                GetAllocationMode::RequesterLocalPromote,
+            ) => Some(slot),
+            (_, GetAllocationMode::ReuseReplica) => None,
+            _ => selected_owner_slot.as_ref(),
+        };
+        let source_route_token = owner_source_route_token(
+            &req.serialize_part.key,
+            one_kv_nodes_routes.put_id,
+            one_kv_nodes_routes.atomic_group.as_deref().cloned(),
+            get_id,
+            actual_owner_source,
+        );
+        let ssd_source_route_token = (source_kind == GetSourceKind::Ssd)
+            .then(|| {
+                owner_ssd_source_route_token(
+                    &view,
+                    &src_node_id,
+                    &req.serialize_part.key,
+                    one_kv_nodes_routes.put_id,
+                    src_len,
+                    one_kv_nodes_routes.atomic_group.as_deref().cloned(),
+                    get_id,
                 )
-            };
+            })
+            .flatten();
+        if source_kind == GetSourceKind::Ssd && ssd_source_route_token.is_none() {
+            continue;
+        }
 
         let resp = GetStartResp {
             put_id: one_kv_nodes_routes.put_id,
@@ -1850,6 +2170,8 @@ pub async fn handle_get_start(
             target_base_addr: resp_target_base,
             len: src_len,
             source_kind,
+            source_route_token: source_route_token.clone(),
+            ssd_source_route_token: ssd_source_route_token.clone(),
             prepared_target: (allocation_mode == GetAllocationMode::LocalCommittedSlot)
                 .then(|| prepared_target.clone())
                 .flatten(),
@@ -1881,7 +2203,8 @@ pub async fn handle_get_start(
             src_addr: resp_src_addr,
             src_base_addr: resp_src_base,
             source_kind,
-            ssd_source_allocation,
+            source_route_token,
+            ssd_source_route_token,
             ssd_stage_lifecycle: (source_kind == GetSourceKind::Ssd)
                 .then(|| Arc::new(super::SsdStageLifecycle::new())),
             atomic_group: one_kv_nodes_routes.atomic_group.as_deref().cloned(),
@@ -1960,7 +2283,7 @@ pub async fn handle_ssd_stage_begin(
         .and_then(|inflight| {
             (inflight.source_kind == GetSourceKind::Ssd
                 && inflight.src_node_id == req_node_id
-                && inflight.ssd_source_allocation.is_some())
+                && inflight.ssd_source_route_token.is_some())
             .then(|| inflight.ssd_stage_lifecycle.as_ref().cloned())
             .flatten()
         })
@@ -3273,6 +3596,8 @@ pub async fn handle_batch_get_start(
             src_base_addr: part.src_base_addr,
             len: part.len,
             source_kind: part.source_kind,
+            source_route_token: part.source_route_token,
+            ssd_source_route_token: part.ssd_source_route_token,
             prepared_target: part.prepared_target,
             reused_committed_slot: part.reused_committed_slot,
             atomic_group: part.atomic_group,
@@ -3324,13 +3649,65 @@ pub async fn handle_batch_get_revoke(
     }
 }
 
+fn late_bind_target_for_done(
+    item: &BatchGetDoneItemReq,
+    already_completed: bool,
+) -> Option<&GetBindTarget> {
+    (!already_completed)
+        .then_some(item.late_target.as_ref())
+        .flatten()
+}
+
 pub async fn handle_batch_get_done(
     view: MasterKvRouterView,
     req: MsgPack<BatchGetDoneReq>,
     req_node_id: NodeID,
 ) -> MsgPack<BatchGetDoneResp> {
     let started_at = Instant::now();
-    let get_ids = req.serialize_part.get_ids;
+    let request_items = req.serialize_part.items;
+    let get_ids = request_items
+        .iter()
+        .map(|item| item.get_id)
+        .collect::<Vec<_>>();
+
+    // Caller-owned late targets remove a separate Bind RTT. Reuse the same
+    // validation/state transition before taking the sorted batch of terminal
+    // locks. A completed operation skips Bind so a lost Done response remains
+    // replayable with the original late target.
+    let mut late_bind_errors = HashMap::<u64, GetDoneResp>::new();
+    for item in &request_items {
+        let already_completed = view
+            .master_kv_router()
+            .inner()
+            .completed_gets
+            .get(&item.get_id)
+            .await
+            .is_some();
+        let Some(target) = late_bind_target_for_done(item, already_completed) else {
+            continue;
+        };
+        let bound = handle_get_bind_item(
+            view.clone(),
+            BatchGetBindItemReq {
+                get_id: item.get_id,
+                target: target.clone(),
+            },
+            req_node_id.clone(),
+        )
+        .await;
+        if bound.error_code != msg_and_error::OK {
+            late_bind_errors.insert(
+                item.get_id,
+                GetDoneResp {
+                    holder_id: 0,
+                    allocation_mode: GetAllocationMode::Temporary,
+                    error_code: bound.error_code,
+                    error_json: bound.error_json,
+                    server_process_us: 0,
+                },
+            );
+        }
+    }
 
     // Hold every per-get terminal lock until the combined route-maintenance
     // batch and idempotency records are durable. Sorting gives overlapping
@@ -3356,6 +3733,34 @@ pub async fn handle_batch_get_done(
     for get_id in get_ids {
         let part = if let Some(part) = response_by_get_id.get(&get_id) {
             part.clone()
+        } else if late_bind_errors.contains_key(&get_id)
+            && view
+                .master_kv_router()
+                .inner()
+                .completed_gets
+                .get(&get_id)
+                .await
+                .is_some()
+        {
+            // A concurrent replay can observe "not completed", then lose the
+            // Bind lock race to the original Done and see the Plan disappear.
+            // Once the terminal lock is held, the completed result is the
+            // authority; never replace it with that stale Bind error.
+            handle_get_done_locked(
+                view.clone(),
+                MsgPack {
+                    serialize_part: GetDoneReq { get_id },
+                    raw_bytes: Vec::new(),
+                },
+                req_node_id.clone(),
+                Some(&mut route_events),
+                Some(&mut deferred_terminals),
+                Some(&mut deferred_post_read_reclaims),
+            )
+            .await
+            .serialize_part
+        } else if let Some(error) = late_bind_errors.get(&get_id) {
+            error.clone()
         } else {
             let part = handle_get_done_locked(
                 view.clone(),

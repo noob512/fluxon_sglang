@@ -983,6 +983,10 @@ pub mod rpc {
     use crate::{NodeID, TaskId};
     use tracing::warn;
 
+    fn should_wait_before_rpc_retry(attempt_idx: usize, total_attempts: usize) -> bool {
+        attempt_idx.saturating_add(1) < total_attempts
+    }
+
     pub use fluxon_commu_contract::p2p::rpc::*;
 
     #[derive(Default)]
@@ -1332,13 +1336,21 @@ pub mod rpc {
                     if matches!(err, P2pError::InvalidRpcTimeout { .. }) {
                         return Err(err);
                     }
-                    warn!(
-                        "RPC call failed with error={:?}, retrying in 5 seconds, msg_id={}",
-                        err,
-                        req.msg_id()
-                    );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
                     failed_count += 1;
+                    if should_wait_before_rpc_retry(attempt_idx, retry) {
+                        warn!(
+                            "RPC call failed with error={:?}, retrying in 5 seconds, msg_id={}",
+                            err,
+                            req.msg_id()
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else {
+                        warn!(
+                            "RPC call failed with error={:?}, no retries remaining, msg_id={}",
+                            err,
+                            req.msg_id()
+                        );
+                    }
                 }
             }
         }
@@ -1466,6 +1478,20 @@ pub mod rpc {
         handler: Arc<dyn UserRpcBytesAsyncHandler>,
     ) {
         p2p.register_user_rpc_bytes_handler_async(path, handler);
+    }
+
+    #[cfg(test)]
+    mod retry_tests {
+        use super::should_wait_before_rpc_retry;
+
+        #[test]
+        fn final_failed_attempt_never_adds_retry_delay() {
+            assert!(!should_wait_before_rpc_retry(0, 0));
+            assert!(!should_wait_before_rpc_retry(0, 1));
+            assert!(should_wait_before_rpc_retry(0, 3));
+            assert!(should_wait_before_rpc_retry(1, 3));
+            assert!(!should_wait_before_rpc_retry(2, 3));
+        }
     }
 }
 

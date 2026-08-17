@@ -846,6 +846,7 @@ fn build_side_transfer_worker_config(
         },
         pprof_duration_seconds: owner_config.pprof_duration_seconds,
         replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),
@@ -898,6 +899,7 @@ fn build_side_transfer_worker_config_yaml(
         contribute_to_cluster_pool_size: None,
         pprof_duration_seconds: side_config.pprof_duration_seconds,
         replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         fluxonkv_spec: crate::config::FluxonKvSpecYaml {
             etcd_addresses: None,
             cluster_name: side_config.cluster_name,
@@ -1968,6 +1970,34 @@ async fn run_client_impl(
             config.test_spec_config.side_transfer_role,
             Some(SideTransferRole::Worker)
         );
+    let owner_placement_class = if is_external {
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid
+    } else {
+        config.owner_placement_class.unwrap_or_else(|| {
+            if config.replica_writeback_hot_capacity_ratio.is_some() {
+                // Transitional compatibility for already-written inference
+                // configs. New deployments set owner_placement_class
+                // explicitly; RemoteCpu is never inferred from topology.
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference
+            } else {
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid
+            }
+        })
+    };
+    let owner_allocation_authority = if owner_placement_class.is_valid() {
+        crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Owner
+    } else {
+        crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master
+    };
+    let owner_local_target_bytes = match owner_placement_class {
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference => {
+            config.replica_writeback_hot_capacity_ratio.map(|ratio| {
+                (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
+            })
+        }
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::RemoteCpu => Some(0),
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid => None,
+    };
     let bootstrapped_shared_meta = if is_side_transfer_worker {
         Some(wait_for_external_bootstrap_bundle(&config).await?.meta)
     } else {
@@ -2008,6 +2038,12 @@ async fn run_client_impl(
         // Owner nodes are the global relay set. Keeping a single metadata marker converges
         // route selection, observability proxy eligibility, and ops topology rendering.
         metadata.insert("p2p_relay".to_string(), "true".to_string());
+        if owner_placement_class.is_valid() {
+            metadata.insert(
+                "owner_placement_class".to_string(),
+                owner_placement_class.as_str().to_string(),
+            );
+        }
         if config.ssd_storage.is_some() {
             metadata.insert(
                 crate::cluster_manager::META_KEY_KV_SSD_STORAGE.to_string(),
@@ -2102,7 +2138,10 @@ async fn run_client_impl(
                 contribute_size: config.contribute_to_cluster_pool_size.clone(),
                 allocation_authority:
                     crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+                owner_placement_class:
+                    crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
                 owner_local_target_bytes: None,
+                owner_segment_memfd: false,
                 share_mem_path: config.share_mem_path.clone(),
                 large_file_paths: config.large_file_paths.clone(),
                 cluster_name: config.cluster_name.clone(),
@@ -2172,33 +2211,23 @@ async fn run_client_impl(
             },
             client_kv_api_arg: ClientKvApiNewArg {
                 test_spec_config: config.test_spec_config.clone(),
-                owner_hot_cache_capacity_bytes: config.replica_writeback_hot_capacity_ratio.map(
-                    |ratio| {
-                        (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
-                    },
-                ),
+                owner_hot_cache_capacity_bytes: owner_local_target_bytes.filter(|_| {
+                    owner_placement_class
+                        == crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference
+                }),
                 owner_local_reserve_physical_capacity_bytes: config
                     .contribute_to_cluster_pool_size
                     .dram,
-                allocation_authority: if config.replica_writeback_hot_capacity_ratio.is_some() {
-                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Owner
-                } else {
-                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master
-                },
+                allocation_authority: owner_allocation_authority,
+                owner_placement_class,
                 ssd_storage: ssd_storage_init,
             },
             client_seg_pool_arg: ClientSegPoolNewArg {
                 contribute_size: config.contribute_to_cluster_pool_size.clone(),
-                allocation_authority: if config.replica_writeback_hot_capacity_ratio.is_some() {
-                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Owner
-                } else {
-                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master
-                },
-                owner_local_target_bytes: config.replica_writeback_hot_capacity_ratio.map(
-                    |ratio| {
-                        (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
-                    },
-                ),
+                allocation_authority: owner_allocation_authority,
+                owner_placement_class,
+                owner_local_target_bytes,
+                owner_segment_memfd: config.test_spec_config.owner_segment_memfd,
                 // Read shared memory path from config (must not be empty).
                 share_mem_path: config.share_mem_path.clone(),
                 large_file_paths: config.large_file_paths.clone(),
@@ -2630,6 +2659,7 @@ mod tests {
             },
             pprof_duration_seconds: None,
             replica_writeback_hot_capacity_ratio: None,
+            owner_placement_class: None,
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: vec!["http://127.0.0.1:2379".to_string()],
@@ -3005,6 +3035,7 @@ mod tests {
             },
             pprof_duration_seconds: None,
             replica_writeback_hot_capacity_ratio: None,
+            owner_placement_class: None,
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: Vec::new(),

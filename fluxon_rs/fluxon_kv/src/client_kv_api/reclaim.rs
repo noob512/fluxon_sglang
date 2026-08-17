@@ -13,6 +13,12 @@ use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
 use limit_thirdparty::tokio;
 use std::{collections::HashMap, sync::Arc};
 
+/// Keep a route-deleted source readable long enough for an already-issued
+/// master Get plan to acquire its exact source lease. A reclaim batch waits
+/// once, then still commits every victim independently.
+pub(crate) const OWNER_RECLAIM_SOURCE_READ_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(50);
+
 fn item_resp(
     item: &OwnerReclaimItem,
     state: OwnerReclaimItemState,
@@ -706,15 +712,14 @@ fn commit_one_with_route_disposition(
         inner
             .owner_segment_allocator
             .lock()
-            .update_committed_manifest_scope(
+            .commit_reserved_global_demotion(
                 &prepared.item.key,
                 prepared.item.put_id,
                 *allocation_id,
                 *segment_offset,
                 *capacity_bytes,
-                crate::owner_segment::OwnerSlotScope::GlobalShared,
             )
-            .expect("owner scope demotion manifest update must succeed");
+            .expect("owner scope demotion reservation must remain valid through commit");
     }
     release_prepared_backing_now(inner, prepared, release_route);
 
@@ -750,7 +755,10 @@ fn commit_demoted_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> Owne
 
 #[cfg(test)]
 mod tests {
-    use super::{reclaim_key_control_busy_detail, reclaim_release_fence_is_intact};
+    use super::{
+        OWNER_RECLAIM_SOURCE_READ_GRACE, reclaim_key_control_busy_detail,
+        reclaim_release_fence_is_intact,
+    };
     use crate::client_kv_api::{
         ExternalGetKeySharedOp, OwnerKeyControlState, OwnerKeyControlTable, OwnerReclaimRecord,
         acquire_external_pending_put_fence_for_key,
@@ -769,6 +777,14 @@ mod tests {
         assert_eq!(
             reclaim_key_control_busy_detail(&controls["pending-key"]),
             Some("owner external put context is still pending")
+        );
+    }
+
+    #[test]
+    fn reclaim_source_read_grace_is_short_and_bounded() {
+        assert_eq!(
+            OWNER_RECLAIM_SOURCE_READ_GRACE,
+            std::time::Duration::from_millis(50)
         );
     }
 
@@ -1006,6 +1022,33 @@ pub(crate) fn complete_owner_source_demotion(
     victim: &OwnerSourceEvictionVictim,
     epoch: u64,
 ) -> Result<(), String> {
+    let OwnerReclaimBacking::CommittedSlot {
+        allocation_id,
+        segment_offset,
+        capacity_bytes,
+    } = &victim.backing
+    else {
+        return Err("metadata-only demotion requires an exact committed owner slot".to_string());
+    };
+    match inner
+        .owner_segment_allocator
+        .lock()
+        .try_reserve_global_demotion(
+            &victim.key,
+            victim.put_id,
+            *allocation_id,
+            *segment_offset,
+            *capacity_bytes,
+        ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(
+                "metadata-only demotion is waiting for exact GlobalShared owner headroom"
+                    .to_string(),
+            );
+        }
+        Err(error) => return Err(error.detail),
+    }
     let item = OwnerReclaimItem {
         key: victim.key.clone(),
         put_id: victim.put_id,
@@ -1090,12 +1133,21 @@ pub async fn handle_batch_owner_reclaim(
             }
             responses
         }
-        OwnerReclaimPhase::Commit => req
-            .serialize_part
-            .items
-            .iter()
-            .map(|item| commit_one(inner, item))
-            .collect(),
+        OwnerReclaimPhase::Commit => {
+            if !req.serialize_part.items.is_empty() {
+                tracing::debug!(
+                    items = req.serialize_part.items.len(),
+                    grace_ms = OWNER_RECLAIM_SOURCE_READ_GRACE.as_millis(),
+                    "owner reclaim retaining route-deleted sources for the read grace window"
+                );
+                tokio::time::sleep(OWNER_RECLAIM_SOURCE_READ_GRACE).await;
+            }
+            req.serialize_part
+                .items
+                .iter()
+                .map(|item| commit_one(inner, item))
+                .collect()
+        }
         OwnerReclaimPhase::Abort => {
             futures::future::join_all(
                 req.serialize_part
