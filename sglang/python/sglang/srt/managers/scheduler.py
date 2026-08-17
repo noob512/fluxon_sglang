@@ -2294,6 +2294,24 @@ class Scheduler(
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
+            if self.server_args.hicache_storage_backend == "fluxon":
+                waiting_uncached_tokens = sum(
+                    max(
+                        0,
+                        waiting_req.seqlen - len(waiting_req.prefix_indices),
+                    )
+                    for waiting_req in self.waiting_queue
+                )
+                self.tree_cache.observe_fluxon_prefetch_scheduler_state(
+                    req.rid,
+                    phase="enqueue",
+                    queue_position=len(self.waiting_queue),
+                    queue_length=len(self.waiting_queue) + 1,
+                    pending_tokens=(
+                        self.load_inquirer._get_num_pending_tokens() + req.seqlen
+                    ),
+                    uncached_tokens=waiting_uncached_tokens + len(new_input_tokens),
+                )
             self.tree_cache.prefetch_from_storage(
                 req.rid,
                 last_host_node,
@@ -2858,7 +2876,12 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        scheduler_pending_tokens = self.load_inquirer._get_num_pending_tokens()
+        scheduler_uncached_tokens = sum(
+            max(0, waiting_req.seqlen - len(waiting_req.prefix_indices))
+            for waiting_req in self.waiting_queue
+        )
+        for queue_position, req in enumerate(self.waiting_queue):
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -2879,6 +2902,15 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
+                if self.server_args.hicache_storage_backend == "fluxon":
+                    self.tree_cache.observe_fluxon_prefetch_scheduler_state(
+                        req.rid,
+                        phase="consume",
+                        queue_position=queue_position,
+                        queue_length=len(self.waiting_queue),
+                        pending_tokens=scheduler_pending_tokens,
+                        uncached_tokens=scheduler_uncached_tokens,
+                    )
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
